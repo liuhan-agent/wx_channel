@@ -84,14 +84,14 @@ func TestLoadBatchRequestAcceptsExpandedWechatLimits(t *testing.T) {
 		limits["works"] = 30
 		limits["top_level_comments_per_work"] = 500
 		limits["replies_per_comment"] = 100
-		limits["replies_per_work"] = 200
+		limits["replies_per_work"] = 1000
 	})
 	request, err := LoadBatchRequest(requestPath, runRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if request.Limits.Works != 30 || request.Limits.TopLevelCommentsPerWork != 500 ||
-		request.Limits.RepliesPerComment != 100 || request.Limits.RepliesPerWork != 200 {
+		request.Limits.RepliesPerComment != 100 || request.Limits.RepliesPerWork != 1000 {
 		t.Fatalf("request=%+v", request)
 	}
 }
@@ -113,7 +113,7 @@ func TestLoadBatchRequestRejectsExpandedLimitOverflow(t *testing.T) {
 				case "replies_per_comment":
 					limits[field] = 101
 				case "replies_per_work":
-					limits[field] = 201
+					limits[field] = 1001
 				}
 			})
 			if _, err := LoadBatchRequest(requestPath, runRoot); err == nil {

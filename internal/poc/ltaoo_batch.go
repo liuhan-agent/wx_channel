@@ -156,7 +156,7 @@ func validateBatchRequest(request *BatchRequest, runRoot string) error {
 	if request.Limits.Works < 1 || request.Limits.Works > 30 ||
 		request.Limits.TopLevelCommentsPerWork < 1 || request.Limits.TopLevelCommentsPerWork > 500 ||
 		request.Limits.RepliesPerComment < 0 || request.Limits.RepliesPerComment > 100 ||
-		request.Limits.RepliesPerWork < 0 || request.Limits.RepliesPerWork > 200 {
+		request.Limits.RepliesPerWork < 0 || request.Limits.RepliesPerWork > 1000 {
 		return errors.New("batch limits are invalid")
 	}
 	repliesDisabled := request.Limits.RepliesPerComment == 0 && request.Limits.RepliesPerWork == 0
