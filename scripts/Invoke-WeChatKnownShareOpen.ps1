@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$ShareUrl
+    [string]$ShareUrl = '',
+    [switch]$EntryOnly,
+    [switch]$Refresh
 )
 
 Set-StrictMode -Version Latest
@@ -143,7 +145,7 @@ function Test-ShareUrl {
     return $uri.AbsolutePath -match '^/sph(?:/|$)|^/finder-preview/pages/sph(?:/|$)'
 }
 
-if (-not (Test-ShareUrl -Value $ShareUrl)) { throw 'wechat_share_url_invalid' }
+if (-not $EntryOnly -and -not (Test-ShareUrl -Value $ShareUrl)) { throw 'wechat_share_url_invalid' }
 
 $mainWindows = @(Get-TopLevelWindowsByProcessName -ProcessName 'Weixin')
 if ($mainWindows.Count -eq 0) { $mainWindows = @(Get-TopLevelWindowsByProcessName -ProcessName 'WeChat') }
@@ -196,17 +198,74 @@ try {
 }
 
 $webView = $null
+$webViewRootHandle = $null
+$webViewTopLevel = $false
+
+function Get-EmbeddedWebViewWindows {
+    param([Parameter(Mandatory = $true)][IntPtr]$HostHandle)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($HostHandle)
+    if ($null -eq $root) { return @() }
+    $windows = [System.Collections.Generic.List[object]]::new()
+    $all = $root.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($element in $all) {
+        $current = $element.Current
+        $handle = [IntPtr]$current.NativeWindowHandle
+        if ($handle -eq [IntPtr]::Zero -or $handle -eq $HostHandle) { continue }
+        $className = [string]$current.ClassName
+        if ($className -notin @('MMUIRenderSubWindowHW', 'Chrome_WidgetWin_0', 'WebView2')) { continue }
+        $rect = [TrendRadar.WeChatChannelAutomation+RECT]::new()
+        [void][TrendRadar.WeChatChannelAutomation]::GetWindowRect($handle, [ref]$rect)
+        if (($rect.Right - $rect.Left) -le 300 -or ($rect.Bottom - $rect.Top) -le 200) { continue }
+        $windows.Add([pscustomobject]@{
+            Handle = $handle
+            HandleText = ('0x{0:X}' -f $handle.ToInt64())
+            Title = [string]$current.Name
+            ProcessName = 'WeChatEmbeddedWebView'
+            Minimized = $false
+            Left = $rect.Left
+            Top = $rect.Top
+            Width = $rect.Right - $rect.Left
+            Height = $rect.Bottom - $rect.Top
+        })
+    }
+    return @($windows | Sort-Object HandleText -Unique)
+}
+
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
     $webViews = @(Get-TopLevelWindowsByProcessName -ProcessName 'WeChatAppEx' | Where-Object { $_.Width -gt 300 -and $_.Height -gt 200 })
-    if ($webViews.Count -eq 1) { $webView = $webViews[0]; break }
+    if ($webViews.Count -eq 1) {
+        $webView = $webViews[0]
+        $webViewRootHandle = $webView.Handle
+        $webViewTopLevel = $true
+        break
+    }
     if ($webViews.Count -gt 1) { throw 'wechat_webview_ambiguous' }
+    $embedded = @(Get-EmbeddedWebViewWindows -HostHandle $main.Handle)
+    if ($embedded.Count -eq 1) {
+        $webView = $embedded[0]
+        $webViewRootHandle = $main.Handle
+        break
+    }
+    if ($embedded.Count -gt 1) { throw 'wechat_webview_ambiguous' }
     Start-Sleep -Milliseconds 500
 }
 if ($null -eq $webView) { throw 'wechat_webview_not_ready' }
-if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($webView.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_webview_activation_failed' }
-Start-Sleep -Milliseconds 200
+if ($webViewTopLevel) {
+    if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($webView.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_webview_activation_failed' }
+    Start-Sleep -Milliseconds 200
+}
 
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($webView.Handle)
+if ($EntryOnly) {
+    if (-not $Refresh) { 'wechat_page_entry_verified'; return }
+    if (-not [TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYDOWN, [IntPtr]0x74, [IntPtr]::Zero)) { throw 'wechat_page_refresh_failed' }
+    [void][TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYUP, [IntPtr]0x74, [IntPtr]::Zero)
+    'wechat_page_refresh_sent'
+    return
+}
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($webViewRootHandle)
 $editCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
 $edits = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition))
 $matches = @(foreach ($edit in $edits) {
@@ -219,6 +278,12 @@ $matches = @(foreach ($edit in $edits) {
 })
 if ($matches.Count -ne 1) { throw 'wechat_share_address_bar_not_ready' }
 $matches[0].Pattern.SetValue($ShareUrl)
+$enteredValue = [string]$matches[0].Pattern.Current.Value
+if ($enteredValue -cne $ShareUrl) { throw 'wechat_share_address_bar_write_failed' }
 if (-not [TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYDOWN, [IntPtr][TrendRadar.WeChatChannelAutomation]::VK_RETURN, [IntPtr]::Zero)) { throw 'wechat_share_navigation_failed' }
 [void][TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYUP, [IntPtr][TrendRadar.WeChatChannelAutomation]::VK_RETURN, [IntPtr]::Zero)
-'wechat_known_share_opened'
+Start-Sleep -Milliseconds 1000
+$postNavigationPattern = $null
+if (-not $matches[0].Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$postNavigationPattern)) { throw 'wechat_share_navigation_not_verified' }
+if ([string]::IsNullOrWhiteSpace([string]$postNavigationPattern.Current.Value)) { throw 'wechat_share_navigation_not_verified' }
+'wechat_known_share_navigation_verified'

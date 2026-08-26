@@ -4,84 +4,10 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if (-not ('TrendRadar.WeChatWindow' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace TrendRadar {
-    public static class WeChatWindow {
-        public const uint WM_KEYDOWN = 0x0100;
-        public const uint WM_KEYUP = 0x0101;
-        public const uint VK_F5 = 0x74;
-        public const int SW_RESTORE = 9;
-
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        public static extern IntPtr GetForegroundWindow();
-
-        [DllImport("user32.dll")]
-        public static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        public static extern bool ShowWindow(IntPtr hWnd, int command);
-
-        [DllImport("user32.dll")]
-        public static extern bool SetForegroundWindow(IntPtr hWnd);
-    }
-}
-'@ -ErrorAction Stop
-}
-
-$processNames = @('Weixin', 'WeChat', 'WeChatAppEx')
-$candidates = @(
-    foreach ($name in $processNames) {
-        foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
-            try {
-                if ($process.MainWindowHandle -eq [IntPtr]::Zero) { continue }
-                if (-not [TrendRadar.WeChatWindow]::IsWindowVisible($process.MainWindowHandle)) { continue }
-                if ([string]::IsNullOrWhiteSpace([string]$process.MainWindowTitle)) { continue }
-                [pscustomobject]@{ Handle = $process.MainWindowHandle; ProcessName = $process.ProcessName }
-            } catch { }
-        }
-    }
-)
-
-if ($candidates.Count -eq 0) { throw 'wechat_window_not_found' }
-
-$foreground = [TrendRadar.WeChatWindow]::GetForegroundWindow()
-$foregroundCandidates = @($candidates | Where-Object { $_.Handle -eq $foreground })
-if ($foregroundCandidates.Count -eq 1) {
-    $selected = $foregroundCandidates[0]
-} elseif (@($candidates | Where-Object { $_.ProcessName -eq 'Weixin' }).Count -eq 1) {
-    $webViews = @($candidates | Where-Object { $_.ProcessName -eq 'WeChatAppEx' })
-    if ($webViews.Count -eq 1) {
-        # The video-channel page is hosted by the single visible WebView;
-        # refreshing only the Weixin host does not reload that page context.
-        $selected = $webViews[0]
-    } else {
-        # WeChatAppEx may expose multiple titled child windows; prefer the
-        # single visible Weixin host process only when no page WebView is unique.
-        $selected = @($candidates | Where-Object { $_.ProcessName -eq 'Weixin' })[0]
-    }
-} elseif ($candidates.Count -eq 1) {
-    $selected = $candidates[0]
-} else {
-    throw 'wechat_window_ambiguous'
-}
-
-[void][TrendRadar.WeChatWindow]::ShowWindow(
-    $selected.Handle,
-    [TrendRadar.WeChatWindow]::SW_RESTORE)
-if (-not [TrendRadar.WeChatWindow]::SetForegroundWindow($selected.Handle)) {
-    throw 'wechat_window_activation_failed'
-}
-Start-Sleep -Milliseconds 150
-
-if (-not [TrendRadar.WeChatWindow]::PostMessage($selected.Handle, [TrendRadar.WeChatWindow]::WM_KEYDOWN, [IntPtr][TrendRadar.WeChatWindow]::VK_F5, [IntPtr]::Zero)) {
+$entryScript = Join-Path $PSScriptRoot 'Invoke-WeChatKnownShareOpen.ps1'
+if (-not [IO.File]::Exists($entryScript)) { throw 'known_share_open_helper_missing' }
+$result = @(& $entryScript -EntryOnly -Refresh)
+if ($result.Count -ne 1 -or [string]$result[0] -cne 'wechat_page_refresh_sent') {
     throw 'wechat_page_refresh_failed'
 }
-[void][TrendRadar.WeChatWindow]::PostMessage($selected.Handle, [TrendRadar.WeChatWindow]::WM_KEYUP, [IntPtr][TrendRadar.WeChatWindow]::VK_F5, [IntPtr]::Zero)
-'wechat_page_refresh_sent'
+$result[0]

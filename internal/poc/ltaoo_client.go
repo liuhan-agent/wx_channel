@@ -18,6 +18,8 @@ const (
 	maxLtaooResponseBytes   = 8 << 20
 	profileReadinessTimeout = time.Minute
 	profileRetryInterval    = 500 * time.Millisecond
+	searchReadinessTimeout  = time.Minute
+	searchRetryInterval     = 500 * time.Millisecond
 )
 
 type profileReadinessOptions struct {
@@ -145,7 +147,12 @@ func (c *LtaooClient) Call(ctx context.Context, method string, body any) ([]byte
 		if err != nil {
 			return nil, err
 		}
-		data, err := decodeLtaooBusinessData(raw)
+		var data json.RawMessage
+		if method == "finderSearch" {
+			data, err = decodeLtaooSearchData(raw)
+		} else {
+			data, err = decodeLtaooBusinessData(raw)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -299,6 +306,28 @@ func decodeLtaooProfileData(raw []byte) (json.RawMessage, error) {
 	return decodeLtaooBusinessData(raw)
 }
 
+func decodeLtaooSearchData(raw []byte) (json.RawMessage, error) {
+	var envelope struct {
+		Code int             `json:"code"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := decodeSingleJSON(raw, &envelope); err != nil {
+		return nil, CategorizedError{Category: ErrorStructure}
+	}
+	if envelope.Code == 400 && (len(envelope.Data) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null"))) {
+		return nil, CategorizedError{Category: ErrorTransient}
+	}
+	var business struct {
+		ErrCode int             `json:"errCode"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if envelope.Code == 0 && decodeSingleJSON(envelope.Data, &business) == nil &&
+		business.ErrCode == 1011 && (len(business.Data) == 0 || bytes.Equal(bytes.TrimSpace(business.Data), []byte("null"))) {
+		return nil, CategorizedError{Category: ErrorTransient}
+	}
+	return decodeLtaooBusinessData(raw)
+}
+
 func decodeSingleJSON(raw []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -356,16 +385,50 @@ func CollectWorksFromURLs(ctx context.Context, client *LtaooClient, rawURLs []st
 // CollectWorksFromSearch discovers works through finderSearch and resolves a
 // public share URL for every selected work before publication.
 func CollectWorksFromSearch(ctx context.Context, client *LtaooClient, keyword string, limits Limits, store CollectorStore) ([]Work, []Issue) {
-	if client == nil || strings.TrimSpace(keyword) == "" || limits.Works < 1 || limits.Works > 30 || store == nil {
+	return collectWorksFromSearch(ctx, client, keyword, limits, store, profileReadinessOptions{
+		Clock:         batchClock{},
+		Timeout:       searchReadinessTimeout,
+		RetryInterval: searchRetryInterval,
+	})
+}
+
+func collectWorksFromSearch(
+	ctx context.Context,
+	client *LtaooClient,
+	keyword string,
+	limits Limits,
+	store CollectorStore,
+	readiness profileReadinessOptions,
+) ([]Work, []Issue) {
+	if client == nil || strings.TrimSpace(keyword) == "" || limits.Works < 1 || limits.Works > 30 || store == nil ||
+		readiness.Clock == nil || readiness.Timeout <= 0 || readiness.RetryInterval <= 0 {
 		return nil, []Issue{{Stage: "content", Code: "invalid_collection_request"}}
 	}
-	collector := NewCollector(client, NewEvidenceRecorder(nil), store, batchClock{})
-	options := DefaultOptions()
-	options.Keyword = strings.TrimSpace(keyword)
-	options.Limits = limits
-	works, _, err := collector.CollectWorks(ctx, options)
-	if err != nil {
-		return works, []Issue{{Stage: "content", Code: profileIssueCode(err)}}
+	collectorOptions := DefaultOptions()
+	collectorOptions.Keyword = strings.TrimSpace(keyword)
+	collectorOptions.Limits = limits
+	deadline := readiness.Clock.Now().Add(readiness.Timeout)
+	var works []Work
+	for {
+		collector := NewCollector(client, NewEvidenceRecorder(nil), store, readiness.Clock)
+		var err error
+		works, _, err = collector.CollectWorks(ctx, collectorOptions)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return works, []Issue{{Stage: "content", Code: "collection_cancelled"}}
+		}
+		if ClassifyError(err) != ErrorTransient {
+			return works, []Issue{{Stage: "content", Code: profileIssueCode(err)}}
+		}
+		remaining := deadline.Sub(readiness.Clock.Now())
+		if remaining <= 0 {
+			return works, []Issue{{Stage: "content", Code: "profile_not_ready"}}
+		}
+		if err := readiness.Clock.Sleep(ctx, min(readiness.RetryInterval, remaining)); err != nil {
+			return works, []Issue{{Stage: "content", Code: "collection_cancelled"}}
+		}
 	}
 	issues := make([]Issue, 0)
 	resolved := make([]Work, 0, len(works))

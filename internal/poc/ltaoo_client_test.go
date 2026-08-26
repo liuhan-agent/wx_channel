@@ -21,6 +21,9 @@ func TestCollectWorksFromURLsUsesOneMinuteProfileReadinessWindow(t *testing.T) {
 	if profileReadinessTimeout != time.Minute {
 		t.Fatalf("profile readiness timeout=%s, want %s", profileReadinessTimeout, time.Minute)
 	}
+	if searchReadinessTimeout != time.Minute {
+		t.Fatalf("search readiness timeout=%s, want %s", searchReadinessTimeout, time.Minute)
+	}
 }
 
 func (c *profileTestClock) Now() time.Time { return c.now }
@@ -169,6 +172,78 @@ func TestLtaooClientSupportsFinderSearchFeedAndShareURL(t *testing.T) {
 	share, err := client.ResolveShareURL(context.Background(), "work-1")
 	if err != nil || share != "https://weixin.qq.com/sph/generated-1" {
 		t.Fatalf("share=%q err=%v", share, err)
+	}
+}
+
+func TestLtaooClientTreatsFinderSearchBridgeInitializationAsTransient(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/channels/contact/search" {
+			http.NotFound(w, r)
+			return
+		}
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = fmt.Fprint(w, `{"code":400,"data":null}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"infoList":[],"lastBuff":""}}}`)
+	}))
+	defer server.Close()
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Call(context.Background(), "finderSearch", map[string]any{"keyword": "桥接初始化"}); err == nil || ClassifyError(err) != ErrorTransient {
+		t.Fatalf("first finderSearch error=%v", err)
+	}
+	if _, err := client.Call(context.Background(), "finderSearch", map[string]any{"keyword": "桥接初始化"}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests=%d", requests)
+	}
+}
+
+func TestCollectWorksFromSearchUsesReadinessWindow(t *testing.T) {
+	searchRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/channels/contact/search":
+			searchRequests++
+			if searchRequests <= 3 {
+				_, _ = fmt.Fprint(w, `{"code":400,"data":null}`)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"infoList":[{"contact":{"username":"ready-account"}}],"lastBuff":""}}}`)
+		case "/api/channels/contact/feed/list":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"ready-search-work","objectNonceId":"ready-search-nonce","objectDesc":{"description":"ready search work","mediaType":2}}],"lastBuffer":""}}}`)
+		case "/api/channels/feed/share_url":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":"https://weixin.qq.com/sph/ready-search"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &profileTestClock{now: time.Unix(600, 0)}
+	limits := Limits{Works: 1, TopLevelCommentsPerWork: 1}
+	works, issues := collectWorksFromSearch(context.Background(), client, "桥接初始化", limits, newTestStore(t, "search-readiness"), profileReadinessOptions{
+		Clock: clock, Timeout: 10 * time.Second, RetryInterval: 500 * time.Millisecond,
+	})
+	if len(works) != 1 || dereference(works[0].WorkID) != "ready-search-work" || len(issues) != 0 {
+		t.Fatalf("works=%+v issues=%+v", works, issues)
+	}
+	if searchRequests != 4 {
+		t.Fatalf("search requests=%d, want 4", searchRequests)
+	}
+	if len(clock.sleeps) < 3 {
+		t.Fatalf("sleeps=%v", clock.sleeps)
 	}
 }
 
