@@ -431,7 +431,7 @@ cert:
         $firstShareUrl = @($request.content_urls | ForEach-Object { [string]$_ })[0]
         if ([string]::IsNullOrWhiteSpace($firstShareUrl)) { throw 'known_share_url_missing' }
         $openCode = @(& $openScript -ShareUrl $firstShareUrl)
-        if ($openCode.Count -ne 1 -or [string]$openCode[0] -cne 'wechat_known_share_opened') {
+        if ($openCode.Count -ne 1 -or [string]$openCode[0] -cne 'wechat_known_share_navigation_verified') {
             throw 'known_share_open_failed'
         }
         Start-Sleep -Milliseconds 500

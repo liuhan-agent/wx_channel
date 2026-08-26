@@ -184,8 +184,7 @@ func TestTrendRadarRuntimeScriptSafety(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"postmessage", "iswindowvisible", "processname", "weixin", "wechatappex", "setforegroundwindow", "showwindow", "sw_restore", "wechat_window_activation_failed", "wechat_page_refresh_sent", "wechat_window_not_found",
-		"wechat_window_ambiguous", "wechat_page_refresh_failed",
+		"invoke-wechatknownshareopen.ps1", "entryonly", "refresh", "wechat_page_refresh_sent", "wechat_page_refresh_failed",
 	} {
 		if !strings.Contains(strings.ToLower(refresh), required) {
 			t.Errorf("page refresh helper missing %q", required)
@@ -193,7 +192,7 @@ func TestTrendRadarRuntimeScriptSafety(t *testing.T) {
 	}
 	for _, required := range []string{
 		"showwindow", "setforegroundwindow", "activatewindow", "attachthreadinput", "setprocessdpiaware", "mouse_event", "wechat_entry_template", "uiautomationclient",
-		"omniboxviewviews", "setvalue", "postmessage", "wechat_known_share_opened", "wechat_entry_template_mismatch",
+		"omniboxviewviews", "setvalue", "postmessage", "wechat_known_share_navigation_verified", "wechat_entry_template_mismatch", "wechatappex", "wechatembeddedwebview", "wechat_webview_not_ready", "wechat_webview_ambiguous",
 	} {
 		if !strings.Contains(strings.ToLower(open), required) {
 			t.Errorf("known-share helper missing %q", required)
