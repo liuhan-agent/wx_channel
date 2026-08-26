@@ -165,6 +165,24 @@ func TestTopLevelStopsAt100AndMarksTruncated(t *testing.T) {
 	}
 }
 
+func TestTopLevelStopsAt500AndMarksTruncated(t *testing.T) {
+	items := make([]map[string]any, 501)
+	for index := range items {
+		items[index] = map[string]any{"commentId": fmt.Sprintf("fixture-expanded-top-%03d", index+1), "content": "fixture-expanded-limit", "contentType": 1}
+	}
+	options := approvedTestOptions()
+	options.Limits.TopLevelCommentsPerWork = 500
+	api := &fixturePageAPI{responses: [][]byte{commentPage(t, items, "fixture-more")}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "expanded-top-limit-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), options, fixtureWork("fixture-expanded-top-work", "fixture-expanded-top-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 500 || summary.TopLevel != 500 || !summary.Truncated || !containsReason(summary.Reasons, "top_level_limit") {
+		t.Fatalf("count=%d summary=%+v", len(comments), summary)
+	}
+}
+
 func TestExactTopLevelLimitStillMarksTruncated(t *testing.T) {
 	items := make([]map[string]any, 100)
 	for index := range items {
@@ -212,6 +230,65 @@ func TestRepliesStopAt200PerWorkAndMarksTruncated(t *testing.T) {
 	}
 	if api.calls != 11 {
 		t.Fatalf("calls=%d", api.calls)
+	}
+}
+
+func TestRepliesStopAt1000PerWorkAndMarksTruncated(t *testing.T) {
+	top := make([]map[string]any, 10)
+	responses := make([][]byte, 1, 11)
+	for rootIndex := range top {
+		rootID := fmt.Sprintf("fixture-expanded-root-%02d", rootIndex+1)
+		top[rootIndex] = map[string]any{"commentId": rootID, "content": "fixture-root", "expandCommentCount": 101}
+		replies := make([]map[string]any, 101)
+		for replyIndex := range replies {
+			replies[replyIndex] = map[string]any{
+				"commentId":      fmt.Sprintf("fixture-expanded-reply-%02d-%03d", rootIndex+1, replyIndex+1),
+				"replyCommentId": rootID,
+				"rootCommentId":  rootID,
+				"content":        "fixture-expanded-reply-limit",
+				"contentType":    1,
+			}
+		}
+		responses = append(responses, commentPage(t, replies, ""))
+	}
+	responses[0] = commentPage(t, top, "")
+	options := approvedTestOptions()
+	options.Limits.RepliesPerComment = 100
+	options.Limits.RepliesPerWork = 1000
+	api := &fixturePageAPI{responses: responses}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "expanded-reply-work-limit-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), options, fixtureWork("fixture-expanded-reply-work", "fixture-expanded-reply-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 1010 || summary.TopLevel != 10 || summary.Replies != 1000 || !summary.Truncated ||
+		!containsReason(summary.Reasons, "reply_per_work_limit") {
+		t.Fatalf("count=%d summary=%+v", len(comments), summary)
+	}
+}
+
+func TestRepliesStopAt100PerCommentAndMarksTruncated(t *testing.T) {
+	top := []map[string]any{{"commentId": "fixture-expanded-root", "content": "fixture-root", "expandCommentCount": 101}}
+	replies := make([]map[string]any, 101)
+	for index := range replies {
+		replies[index] = map[string]any{
+			"commentId": fmt.Sprintf("fixture-expanded-reply-%03d", index+1),
+			"replyCommentId": "fixture-expanded-root",
+			"rootCommentId": "fixture-expanded-root",
+			"content": "fixture-expanded-reply-limit",
+			"contentType": 1,
+		}
+	}
+	options := approvedTestOptions()
+	options.Limits.RepliesPerComment = 100
+	api := &fixturePageAPI{responses: [][]byte{commentPage(t, top, ""), commentPage(t, replies, "")}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "expanded-reply-limit-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), options, fixtureWork("fixture-expanded-reply-work", "fixture-expanded-reply-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 101 || summary.Replies != 100 || !summary.Truncated || !containsReason(summary.Reasons, "reply_per_comment_limit") {
+		t.Fatalf("count=%d summary=%+v", len(comments), summary)
 	}
 }
 
