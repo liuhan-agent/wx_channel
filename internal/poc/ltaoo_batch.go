@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,7 +18,11 @@ import (
 	"time"
 )
 
-const BatchSchemaVersion = "wechat-channels-batch/1"
+const BatchSchemaVersion = "wechat-channels-batch/2"
+
+var defaultCommentMediaLimits = CommentMediaLimits{
+	PerComment: 4, PerBatch: 100, PerFileBytes: 8 << 20, Timeout: 10 * time.Second,
+}
 
 type BatchStatus string
 
@@ -181,6 +186,17 @@ func validateBatchRequest(request *BatchRequest, runRoot string) error {
 }
 
 func RunLtaooBatch(ctx context.Context, request BatchRequest, client *LtaooClient, runRoot string) (BatchDraftResult, error) {
+	return runLtaooBatchWithMedia(ctx, request, client, runRoot, http.DefaultClient, nil)
+}
+
+func runLtaooBatchWithMedia(
+	ctx context.Context,
+	request BatchRequest,
+	client *LtaooClient,
+	runRoot string,
+	mediaClient *http.Client,
+	allowedMediaHosts map[string]struct{},
+) (BatchDraftResult, error) {
 	root, err := existingCanonicalDirectory(runRoot)
 	if err != nil {
 		return BatchDraftResult{}, errors.New("batch run root is unsafe")
@@ -212,6 +228,10 @@ func RunLtaooBatch(ctx context.Context, request BatchRequest, client *LtaooClien
 	issues := make([]Issue, 0)
 	works := make([]Work, 0)
 	comments := make([]Comment, 0)
+	mediaAssets := make([]BatchMediaAsset, 0)
+	mediaResolver := newCommentMediaResolver(
+		mediaClient, filepath.Join(draftRoot, "media"), defaultCommentMediaLimits, allowedMediaHosts,
+	)
 
 	if err := client.Status(ctx); err != nil {
 		issues = append(issues, Issue{Stage: "startup", Code: "ltaoo_unavailable"})
@@ -231,6 +251,16 @@ func RunLtaooBatch(ctx context.Context, request BatchRequest, client *LtaooClien
 		works[index].Locator.Keyword = request.Keyword
 		collected, summary, collectErr := collector.CollectComments(ctx, Options{Limits: request.Limits}, works[index])
 		comments = append(comments, collected...)
+		for _, candidate := range collector.drainCommentMediaCandidates() {
+			asset, issue := mediaResolver.ResolveContext(ctx, candidate)
+			if issue != nil {
+				issues = append(issues, Issue{
+					Stage: "media", Code: issue.code, WorkID: dereferenceString(works[index].WorkID),
+				})
+				continue
+			}
+			mediaAssets = append(mediaAssets, asset)
+		}
 		works[index].TopLevelCommentCount = summary.TopLevel
 		works[index].ReplyCount = summary.Replies
 		works[index].Truncation.Truncated = summary.Truncated
@@ -258,10 +288,12 @@ func RunLtaooBatch(ctx context.Context, request BatchRequest, client *LtaooClien
 		result.Targets = append(result.Targets, target)
 	}
 	for _, issue := range issues {
-		if issue.Code != "works_limit_reached" && result.Status == BatchSucceeded {
+		if issue.Stage != "media" && issue.Code != "works_limit_reached" && result.Status == BatchSucceeded {
 			result.Status = BatchPartial
 		}
-		appendUniqueString(&result.ReasonCodes, issue.Code)
+		if issue.Stage != "media" {
+			appendUniqueString(&result.ReasonCodes, issue.Code)
+		}
 	}
 	result.Counts = countBatchRecords(works, comments)
 	result.CompletedAt = time.Now().UTC()
@@ -273,6 +305,9 @@ func RunLtaooBatch(ctx context.Context, request BatchRequest, client *LtaooClien
 		return BatchDraftResult{}, err
 	}
 	if err := writeJSONLines(filepath.Join(draftRoot, "issues.jsonl"), issues); err != nil {
+		return BatchDraftResult{}, err
+	}
+	if err := writeJSONLines(filepath.Join(draftRoot, "media-assets.jsonl"), mediaAssets); err != nil {
 		return BatchDraftResult{}, err
 	}
 	if err := writeAtomicJSON(filepath.Join(root, "collection-result.json"), result); err != nil {
@@ -316,14 +351,9 @@ func FinalizeLtaooBatch(request BatchRequest, runRoot, cleanupReceiptPath string
 	if err := writeAtomicJSON(receiptTarget, receipt); err != nil {
 		return BatchManifest{}, err
 	}
-	fileNames := []string{"cleanup-receipt.json", "comments.jsonl", "contents.jsonl", "issues.jsonl"}
-	files := make(map[string]BatchFileRecord, len(fileNames))
-	for _, name := range fileNames {
-		record, err := inspectBatchFile(filepath.Join(draftRoot, name))
-		if err != nil {
-			return BatchManifest{}, err
-		}
-		files[name] = record
+	files, err := inspectBatchV2Draft(draftRoot)
+	if err != nil {
+		return BatchManifest{}, err
 	}
 	status := result.Status
 	reasons := append([]string(nil), result.ReasonCodes...)
@@ -595,6 +625,244 @@ func inspectBatchFile(path string) (BatchFileRecord, error) {
 		lines = strings.Count(string(raw), "\n")
 	}
 	return BatchFileRecord{SHA256: hex.EncodeToString(digest[:]), Bytes: int64(len(raw)), Lines: lines}, nil
+}
+
+func inspectBatchV2Draft(draftRoot string) (map[string]BatchFileRecord, error) {
+	mediaRoot := filepath.Join(draftRoot, "media")
+	if err := validateExistingDirectory(draftRoot, mediaRoot); err != nil {
+		return nil, errors.New("batch media directory is unsafe")
+	}
+	temporaryRoot := filepath.Join(mediaRoot, ".tmp")
+	if err := removeContainedTree(draftRoot, temporaryRoot); err != nil {
+		return nil, errors.New("remove batch media temporary files")
+	}
+
+	rootEntries, err := os.ReadDir(draftRoot)
+	if err != nil {
+		return nil, errors.New("read batch draft")
+	}
+	expectedRoot := map[string]bool{
+		"cleanup-receipt.json": false,
+		"comments.jsonl":       false,
+		"contents.jsonl":       false,
+		"issues.jsonl":         false,
+		"media-assets.jsonl":   false,
+		"media":                true,
+	}
+	for _, entry := range rootEntries {
+		wantDirectory, allowed := expectedRoot[entry.Name()]
+		if !allowed || entry.IsDir() != wantDirectory {
+			return nil, errors.New("batch draft contains an unexpected artifact")
+		}
+		if err := rejectPlatformReparse(filepath.Join(draftRoot, entry.Name())); err != nil {
+			return nil, errors.New("batch draft contains a reparse point")
+		}
+	}
+	if len(rootEntries) != len(expectedRoot) {
+		return nil, errors.New("batch draft is missing a required artifact")
+	}
+
+	commentMedia, err := readBatchV2CommentMedia(filepath.Join(draftRoot, "comments.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	assets, err := readBatchMediaAssets(filepath.Join(draftRoot, "media-assets.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	mediaRecords, err := inspectBatchMediaFiles(mediaRoot, assets, commentMedia)
+	if err != nil {
+		return nil, err
+	}
+
+	jsonNames := []string{"cleanup-receipt.json", "comments.jsonl", "contents.jsonl", "issues.jsonl", "media-assets.jsonl"}
+	files := make(map[string]BatchFileRecord, len(jsonNames)+len(mediaRecords))
+	for _, name := range jsonNames {
+		record, inspectErr := inspectBatchFile(filepath.Join(draftRoot, name))
+		if inspectErr != nil {
+			return nil, inspectErr
+		}
+		files[name] = record
+	}
+	for name, record := range mediaRecords {
+		files[name] = record
+	}
+	return files, nil
+}
+
+func readBatchV2CommentMedia(path string) (map[string]map[string]struct{}, error) {
+	comments := make([]Comment, 0)
+	if err := readStrictJSONLines(path, 64<<20, &comments); err != nil {
+		return nil, errors.New("batch comments are invalid")
+	}
+	associations := make(map[string]map[string]struct{})
+	for _, comment := range comments {
+		if len(comment.Content.MediaTypes) == 0 {
+			return nil, errors.New("batch comment media types are invalid")
+		}
+		seenTypes := make(map[string]struct{}, len(comment.Content.MediaTypes))
+		hasMedia := false
+		for _, mediaType := range comment.Content.MediaTypes {
+			if mediaType != "text" && mediaType != "image" && mediaType != "sticker" && mediaType != "unknown_non_text" {
+				return nil, errors.New("batch comment media types are invalid")
+			}
+			if _, duplicate := seenTypes[mediaType]; duplicate {
+				return nil, errors.New("batch comment media types are duplicated")
+			}
+			seenTypes[mediaType] = struct{}{}
+			if mediaType == "image" || mediaType == "sticker" {
+				hasMedia = true
+			}
+		}
+		if hasMedia != validCommentMediaRef(comment.Content.MediaRef) {
+			return nil, errors.New("batch comment media reference is invalid")
+		}
+		if hasMedia {
+			if _, duplicate := associations[comment.Content.MediaRef]; duplicate {
+				return nil, errors.New("batch comment media reference is duplicated")
+			}
+			associations[comment.Content.MediaRef] = seenTypes
+		}
+	}
+	return associations, nil
+}
+
+func readBatchMediaAssets(path string) ([]BatchMediaAsset, error) {
+	assets := make([]BatchMediaAsset, 0)
+	if err := readStrictJSONLines(path, 64<<20, &assets); err != nil {
+		return nil, errors.New("batch media asset manifest is invalid")
+	}
+	return assets, nil
+}
+
+func readStrictJSONLines[T any](path string, maxBytes int64, values *[]T) error {
+	if values == nil || requireRegularFileWithoutReparse(path, maxBytes) != nil {
+		return errors.New("JSONL file is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(io.LimitReader(file, maxBytes+1))
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	for scanner.Scan() {
+		if len(scanner.Bytes()) == 0 {
+			return errors.New("JSONL contains an empty record")
+		}
+		decoder := json.NewDecoder(strings.NewReader(scanner.Text()))
+		decoder.DisallowUnknownFields()
+		var value T
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return errors.New("JSONL record contains trailing content")
+		}
+		*values = append(*values, value)
+	}
+	return scanner.Err()
+}
+
+func inspectBatchMediaFiles(
+	mediaRoot string,
+	assets []BatchMediaAsset,
+	commentMedia map[string]map[string]struct{},
+) (map[string]BatchFileRecord, error) {
+	entries, err := os.ReadDir(mediaRoot)
+	if err != nil {
+		return nil, errors.New("read batch media directory")
+	}
+	records := make(map[string]BatchFileRecord, len(entries))
+	for _, entry := range entries {
+		path := filepath.Join(mediaRoot, entry.Name())
+		if entry.IsDir() || rejectPlatformReparse(path) != nil {
+			return nil, errors.New("batch media contains an unsafe entry")
+		}
+		relativePath := filepath.ToSlash(filepath.Join("media", entry.Name()))
+		record, inspectErr := inspectBatchBinaryFile(path, 8<<20)
+		if inspectErr != nil {
+			return nil, inspectErr
+		}
+		records[relativePath] = record
+	}
+
+	seenSources := make(map[string]struct{}, len(assets))
+	seenPaths := make(map[string]struct{}, len(assets))
+	for _, asset := range assets {
+		mediaTypes, knownComment := commentMedia[asset.CommentRef]
+		_, matchingType := mediaTypes[asset.MediaType]
+		expectedExtension, knownMIME := commentMediaExtension(asset.MIMEType)
+		expectedName := asset.SHA256 + expectedExtension
+		if !knownComment || !matchingType || (asset.MediaType != "image" && asset.MediaType != "sticker") ||
+			!validLowerSHA256(asset.SHA256) || !knownMIME || asset.Bytes <= 0 ||
+			asset.RelativePath != filepath.ToSlash(filepath.Join("media", expectedName)) ||
+			asset.SourceKey != asset.MediaType+":"+strings.TrimPrefix(asset.SourceKey, asset.MediaType+":") ||
+			!validLowerSHA256(strings.TrimPrefix(asset.SourceKey, asset.MediaType+":")) {
+			return nil, errors.New("batch media asset record is invalid")
+		}
+		if _, duplicate := seenSources[asset.SourceKey]; duplicate {
+			return nil, errors.New("batch media source key is duplicated")
+		}
+		if _, duplicate := seenPaths[asset.RelativePath]; duplicate {
+			return nil, errors.New("batch media path is duplicated")
+		}
+		record, present := records[asset.RelativePath]
+		if !present || record.SHA256 != asset.SHA256 || record.Bytes != asset.Bytes || record.Lines != 0 {
+			return nil, errors.New("batch media asset file mismatch")
+		}
+		seenSources[asset.SourceKey] = struct{}{}
+		seenPaths[asset.RelativePath] = struct{}{}
+	}
+	if len(seenPaths) != len(records) {
+		return nil, errors.New("batch media contains an unreferenced file")
+	}
+	return records, nil
+}
+
+func inspectBatchBinaryFile(path string, maxBytes int64) (BatchFileRecord, error) {
+	if err := requireRegularFileWithoutReparse(path, maxBytes); err != nil {
+		return BatchFileRecord{}, errors.New("batch media file is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return BatchFileRecord{}, err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	bytesWritten, err := io.Copy(digest, file)
+	if err != nil {
+		return BatchFileRecord{}, errors.New("read batch media file")
+	}
+	return BatchFileRecord{SHA256: hex.EncodeToString(digest.Sum(nil)), Bytes: bytesWritten, Lines: 0}, nil
+}
+
+func validCommentMediaRef(value string) bool {
+	return strings.HasPrefix(value, "sha256:") && validLowerSHA256(strings.TrimPrefix(value, "sha256:"))
+}
+
+func validLowerSHA256(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func commentMediaExtension(mimeType string) (string, bool) {
+	switch mimeType {
+	case "image/png":
+		return ".png", true
+	case "image/jpeg":
+		return ".jpg", true
+	case "image/gif":
+		return ".gif", true
+	case "image/webp":
+		return ".webp", true
+	default:
+		return "", false
+	}
 }
 
 func countBatchRecords(works []Work, comments []Comment) Counts {

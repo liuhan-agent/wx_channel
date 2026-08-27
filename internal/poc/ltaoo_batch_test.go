@@ -98,9 +98,9 @@ func TestLoadBatchRequestAcceptsExpandedWechatLimits(t *testing.T) {
 
 func TestLoadBatchRequestRejectsExpandedLimitOverflow(t *testing.T) {
 	for name, field := range map[string]string{
-		"top-level comments": "top_level_comments_per_work",
+		"top-level comments":  "top_level_comments_per_work",
 		"replies per comment": "replies_per_comment",
-		"replies per work": "replies_per_work",
+		"replies per work":    "replies_per_work",
 	} {
 		t.Run(name, func(t *testing.T) {
 			runRoot := t.TempDir()
@@ -164,12 +164,12 @@ func TestRunAndFinalizeLtaooBatchPublishesOnlyClosedVerifiedFiles(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"cleanup-receipt.json", "comments.jsonl", "contents.jsonl", "issues.jsonl", "manifest.json"}
+	wantNames := []string{"cleanup-receipt.json", "comments.jsonl", "contents.jsonl", "issues.jsonl", "manifest.json", "media", "media-assets.jsonl"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("entries=%v", entries)
 	}
 	for index, entry := range entries {
-		if entry.Name() != wantNames[index] || entry.IsDir() {
+		if entry.Name() != wantNames[index] || entry.IsDir() != (entry.Name() == "media") {
 			t.Fatalf("entry[%d]=%s", index, entry.Name())
 		}
 	}
@@ -192,6 +192,9 @@ func TestRunAndFinalizeLtaooBatchPublishesOnlyClosedVerifiedFiles(t *testing.T) 
 	}
 	var all strings.Builder
 	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
 		raw, err := os.ReadFile(filepath.Join(batchRoot, entry.Name()))
 		if err != nil {
 			t.Fatal(err)
@@ -206,6 +209,164 @@ func TestRunAndFinalizeLtaooBatchPublishesOnlyClosedVerifiedFiles(t *testing.T) 
 	}
 	if _, err := FinalizeLtaooBatch(request, runRoot, receiptPath); err == nil {
 		t.Fatal("existing final batch was overwritten")
+	}
+}
+
+func TestRunAndFinalizeLtaooBatchPublishesVerifiedMediaAssets(t *testing.T) {
+	const forbidden = "token=never-persist-media"
+	payload := testImageBytes(t, "png")
+	mediaServer := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "image/png")
+		_, _ = writer.Write(payload)
+	}))
+	defer mediaServer.Close()
+	server := newBatchFixtureServerWithComment(t, "", fmt.Sprintf(
+		`{"commentId":"batch-root-1","content":"public root","contentInfo":{"imageInfos":[{"Url":%q}]},"expandCommentCount":0}`,
+		mediaServer.URL+"/image.png?"+forbidden,
+	))
+	defer server.Close()
+
+	runRoot := t.TempDir()
+	requestPath := filepath.Join(runRoot, "request.json")
+	writeBatchRequestFixture(t, requestPath, runRoot, nil)
+	request, err := LoadBatchRequest(requestPath, runRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runLtaooBatchWithMedia(
+		context.Background(), request, client, runRoot, mediaServer.Client(), testAllowedHosts(t, mediaServer.URL),
+	); err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(runRoot, "cleanup-receipt.input.json")
+	writeCleanupReceiptFixture(t, receiptPath, request.RunID, true)
+	manifest, err := FinalizeLtaooBatch(request, runRoot, receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SchemaVersion != "wechat-channels-batch/2" || manifest.Status != BatchSucceeded {
+		t.Fatalf("manifest=%+v", manifest)
+	}
+	assetRaw, err := os.ReadFile(filepath.Join(runRoot, "batch", "media-assets.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asset BatchMediaAsset
+	if err := json.Unmarshal(assetRaw[:len(assetRaw)-1], &asset); err != nil {
+		t.Fatal(err)
+	}
+	if asset.MediaType != "image" || asset.MIMEType != "image/png" || asset.Bytes != int64(len(payload)) {
+		t.Fatalf("asset=%+v", asset)
+	}
+	if strings.Contains(string(assetRaw), forbidden) || strings.Contains(string(assetRaw), mediaServer.URL) {
+		t.Fatalf("media asset leaked locator: %s", assetRaw)
+	}
+	mediaRecord, ok := manifest.Files[asset.RelativePath]
+	if !ok || mediaRecord.Lines != 0 || mediaRecord.Bytes != int64(len(payload)) {
+		t.Fatalf("media record=%+v present=%v", mediaRecord, ok)
+	}
+	stored, err := os.ReadFile(filepath.Join(runRoot, "batch", filepath.FromSlash(asset.RelativePath)))
+	if err != nil || !strings.EqualFold(asset.SHA256, mediaRecord.SHA256) || string(stored) != string(payload) {
+		t.Fatalf("stored media mismatch: err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runRoot, "batch", "media", ".tmp")); !os.IsNotExist(err) {
+		t.Fatalf("temporary media directory was published: %v", err)
+	}
+}
+
+func TestRunLtaooBatchMediaFailureKeepsCompletedComment(t *testing.T) {
+	mediaServer := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "image/png")
+		_, _ = writer.Write([]byte("not-an-image"))
+	}))
+	defer mediaServer.Close()
+	server := newBatchFixtureServerWithComment(t, "", fmt.Sprintf(
+		`{"commentId":"batch-root-1","contentInfo":{"imageInfos":[{"Url":%q}]},"expandCommentCount":0}`,
+		mediaServer.URL+"/invalid.png",
+	))
+	defer server.Close()
+	runRoot := t.TempDir()
+	requestPath := filepath.Join(runRoot, "request.json")
+	writeBatchRequestFixture(t, requestPath, runRoot, nil)
+	request, err := LoadBatchRequest(requestPath, runRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runLtaooBatchWithMedia(
+		context.Background(), request, client, runRoot, mediaServer.Client(), testAllowedHosts(t, mediaServer.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != BatchSucceeded || result.Counts.TopLevelComments != 1 || result.Targets[0].Status != "completed" {
+		t.Fatalf("result=%+v", result)
+	}
+	assets, err := os.ReadFile(filepath.Join(runRoot, "batch.partial-"+request.RunID, "media-assets.jsonl"))
+	if err != nil || len(assets) != 0 {
+		t.Fatalf("assets=%q err=%v", assets, err)
+	}
+	issues, err := os.ReadFile(filepath.Join(runRoot, "batch.partial-"+request.RunID, "issues.jsonl"))
+	if err != nil || !strings.Contains(string(issues), `"stage":"media","code":"media_unavailable","work_id":"batch-work-1"`) {
+		t.Fatalf("issues=%s err=%v", issues, err)
+	}
+}
+
+func TestFinalizeLtaooBatchRejectsInvalidV2MediaLayout(t *testing.T) {
+	for name, mutate := range map[string]func(*testing.T, string){
+		"missing asset manifest": func(t *testing.T, draftRoot string) {
+			if err := os.Remove(filepath.Join(draftRoot, "media-assets.jsonl")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"legacy media type field": func(t *testing.T, draftRoot string) {
+			path := filepath.Join(draftRoot, "comments.jsonl")
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw = []byte(strings.Replace(string(raw), `"media_types":["text"]`, `"media_type":"text"`, 1))
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"extra media file": func(t *testing.T, draftRoot string) {
+			if err := os.WriteFile(filepath.Join(draftRoot, "media", "extra.png"), testImageBytes(t, "png"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := newBatchFixtureServer(t, "")
+			defer server.Close()
+			runRoot := t.TempDir()
+			requestPath := filepath.Join(runRoot, "request.json")
+			writeBatchRequestFixture(t, requestPath, runRoot, nil)
+			request, err := LoadBatchRequest(requestPath, runRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := NewLtaooClient(server.URL, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := RunLtaooBatch(context.Background(), request, client, runRoot); err != nil {
+				t.Fatal(err)
+			}
+			mutate(t, filepath.Join(runRoot, "batch.partial-"+request.RunID))
+			receiptPath := filepath.Join(runRoot, "cleanup-receipt.input.json")
+			writeCleanupReceiptFixture(t, receiptPath, request.RunID, true)
+			if _, err := FinalizeLtaooBatch(request, runRoot, receiptPath); err == nil {
+				t.Fatal("invalid v2 media layout was accepted")
+			}
+		})
 	}
 }
 
@@ -463,6 +624,15 @@ func writeCleanupReceiptFixture(t *testing.T, path, runID string, safe bool) {
 
 func newBatchFixtureServer(t *testing.T, forbidden string) *httptest.Server {
 	t.Helper()
+	rootComment := fmt.Sprintf(
+		`{"commentId":"batch-root-1","content":"public root","expandCommentCount":2,"privateHeader":%q}`,
+		forbidden,
+	)
+	return newBatchFixtureServerWithComment(t, forbidden, rootComment)
+}
+
+func newBatchFixtureServerWithComment(t *testing.T, forbidden, rootComment string) *httptest.Server {
+	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -478,7 +648,7 @@ func newBatchFixtureServer(t *testing.T, forbidden string) *httptest.Server {
 			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":"https://weixin.qq.com/sph/generated-batch-1"}}}`)
 		case "/api/channels/feed/comment/list":
 			if r.URL.Query().Get("comment_id") == "" {
-				_, _ = fmt.Fprintf(w, `{"code":0,"data":{"errCode":0,"data":{"commentInfo":[{"commentId":"batch-root-1","content":"public root","expandCommentCount":2,"privateHeader":%q}],"lastBuffer":""}}}`, forbidden)
+				_, _ = fmt.Fprintf(w, `{"code":0,"data":{"errCode":0,"data":{"commentInfo":[%s],"lastBuffer":""}}}`, rootComment)
 				return
 			}
 			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"errCode":0,"data":{"commentInfo":[{"commentId":"batch-reply-1","replyCommentId":"batch-root-1","rootCommentId":"batch-root-1","content":"public reply one"},{"commentId":"batch-reply-2","replyCommentId":"batch-reply-1","rootCommentId":"batch-root-1","content":"public reply two"}],"debugCursor":%q,"lastBuffer":""}}}`, forbidden)
