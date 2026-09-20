@@ -41,10 +41,11 @@ type WaitController struct {
 	policy   HumanWaitPolicy
 	commands <-chan OperatorCommand
 	events   chan WaitEvent
+	progress *manualProgressWriter
 }
 
 func NewWaitController(clock Clock, policy HumanWaitPolicy, commands <-chan OperatorCommand) *WaitController {
-	return &WaitController{clock: clock, policy: policy, commands: commands, events: make(chan WaitEvent, 8)}
+	return &WaitController{clock: clock, policy: policy, commands: commands, events: make(chan WaitEvent, 8), progress: newManualProgressWriter()}
 }
 
 func (w *WaitController) Events() <-chan WaitEvent {
@@ -58,15 +59,18 @@ func (w *WaitController) Wait(ctx context.Context, reason WaitReason, workRank i
 	if w == nil || w.clock == nil || w.policy.Timeout <= 0 {
 		return WaitTimedOut
 	}
+	w.progress.begin(progressReason(reason))
 	extensions := 0
 	deadline := clockAfter(w.clock, w.policy.Timeout)
 	commands := w.commands
 	for {
 		select {
 		case <-ctx.Done():
+			w.progress.finish("timed_out")
 			w.emit(WaitEvent{Kind: "cancelled", Reason: reason, WorkRank: workRank})
 			return WaitCancelled
 		case <-ready:
+			w.progress.finish("resumed")
 			w.emit(WaitEvent{Kind: "resolved", Reason: reason, WorkRank: workRank})
 			return WaitResolved
 		case command, open := <-commands:
@@ -76,6 +80,7 @@ func (w *WaitController) Wait(ctx context.Context, reason WaitReason, workRank i
 			}
 			switch command {
 			case OperatorCancel:
+				w.progress.finish("timed_out")
 				w.emit(WaitEvent{Kind: "cancelled", Reason: reason, WorkRank: workRank})
 				return WaitCancelled
 			case OperatorExtend:
@@ -88,6 +93,7 @@ func (w *WaitController) Wait(ctx context.Context, reason WaitReason, workRank i
 				w.emit(WaitEvent{Kind: "extension_accepted", Reason: reason, WorkRank: workRank})
 			}
 		case <-deadline:
+			w.progress.finish("timed_out")
 			w.emit(WaitEvent{Kind: "timed_out", Reason: reason, WorkRank: workRank})
 			return WaitTimedOut
 		}

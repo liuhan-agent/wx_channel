@@ -82,18 +82,16 @@ func (c *manualClock) waitTimer(t *testing.T) {
 	}
 }
 
-func TestWaitAllowsOne300SecondExtension(t *testing.T) {
+func TestWaitRejectsExtensionAndTimesOutAt180Seconds(t *testing.T) {
 	clock := newManualClock()
 	controls := make(chan OperatorCommand, 2)
 	ready := make(chan struct{})
-	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 300 * time.Second, Extension: 300 * time.Second, MaxExtensions: 1}, controls)
+	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 180 * time.Second}, controls)
 	done := make(chan WaitResult, 1)
 	go func() { done <- waiter.Wait(context.Background(), WaitLogin, 0, ready) }()
 	clock.waitTimer(t)
-	clock.Advance(299 * time.Second)
+	clock.Advance(179 * time.Second)
 	controls <- OperatorExtend
-	clock.waitTimer(t)
-	clock.Advance(299 * time.Second)
 	select {
 	case result := <-done:
 		t.Fatalf("wait ended early: %s", result)
@@ -108,11 +106,9 @@ func TestWaitAllowsOne300SecondExtension(t *testing.T) {
 func TestSecondExtensionIsRejected(t *testing.T) {
 	clock := newManualClock()
 	controls := make(chan OperatorCommand, 2)
-	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 300 * time.Second, Extension: 300 * time.Second, MaxExtensions: 1}, controls)
+	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 180 * time.Second}, controls)
 	done := make(chan WaitResult, 1)
 	go func() { done <- waiter.Wait(context.Background(), WaitVerification, 2, nil) }()
-	clock.waitTimer(t)
-	controls <- OperatorExtend
 	clock.waitTimer(t)
 	controls <- OperatorExtend
 	for {
@@ -124,7 +120,7 @@ func TestSecondExtensionIsRejected(t *testing.T) {
 			break
 		}
 	}
-	clock.Advance(300 * time.Second)
+	clock.Advance(180 * time.Second)
 	if got := <-done; got != WaitTimedOut {
 		t.Fatalf("got=%s", got)
 	}
@@ -133,7 +129,7 @@ func TestSecondExtensionIsRejected(t *testing.T) {
 func TestReadySignalResolvesWaitWithoutRequest(t *testing.T) {
 	clock := newManualClock()
 	ready := make(chan struct{})
-	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 300 * time.Second}, nil)
+	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 180 * time.Second}, nil)
 	done := make(chan WaitResult, 1)
 	go func() { done <- waiter.Wait(context.Background(), WaitTargetContext, 3, ready) }()
 	clock.waitTimer(t)
@@ -198,7 +194,7 @@ func TestTargetContextWaitRetriesReadOnlyRequestOnce(t *testing.T) {
 		{raw: []byte(`{"data":{"objectList":[],"lastBuffer":""}}`)},
 	}}
 	clock := newManualClock()
-	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 300 * time.Second}, nil)
+	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 180 * time.Second}, nil)
 	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "context-retry-job"), clock)
 	collector.ConfigureHumanWait(waiter, func(reason WaitReason, rank int) <-chan struct{} {
 		if reason != WaitTargetContext || rank != 0 {

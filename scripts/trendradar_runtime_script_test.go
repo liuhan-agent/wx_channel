@@ -177,7 +177,8 @@ func TestTrendRadarRuntimeScriptSafety(t *testing.T) {
 		"-datadirectory (split-path -parent $resolvedrouterconfig)",
 		"safefailurecode", "runtime_failed",
 		"autorefreshwechatpage", "invoke-wechatpagerefresh.ps1",
-		"autoopenfirstshareurl", "invoke-wechatknownshareopen.ps1", "known_share_open_failed",
+		"autoopenfirstshareurl", "invoke-wechatknownshareopen.ps1", "known_share_open_failed", "wechat_channel_home_open_failed",
+		"wait-ltaoochannelsbridge", "test-ltaoochannelsbridgeavailable", "/api/channels/status", "bridge_unavailable",
 	} {
 		if !strings.Contains(combined, required) {
 			t.Errorf("runtime scripts missing %q", required)
@@ -192,7 +193,7 @@ func TestTrendRadarRuntimeScriptSafety(t *testing.T) {
 	}
 	for _, required := range []string{
 		"showwindow", "setforegroundwindow", "activatewindow", "attachthreadinput", "setprocessdpiaware", "mouse_event", "wechat_entry_template", "uiautomationclient",
-		"omniboxviewviews", "setvalue", "postmessage", "wechat_known_share_navigation_verified", "wechat_entry_template_mismatch", "wechatappex", "wechatembeddedwebview", "wechat_webview_not_ready", "wechat_webview_ambiguous",
+		"omniboxviewviews", "setvalue", "postmessage", "keybd_event", "get-addressbarmatches", "select-wechatmainwindow", "wechat_known_share_navigation_verified", "wechat_channel_entry_template_mismatch", "wechat_channel_menu_not_ready", "wechatappex", "wechatembeddedwebview", "wechat_webview_not_ready", "wechat_webview_ambiguous",
 	} {
 		if !strings.Contains(strings.ToLower(open), required) {
 			t.Errorf("known-share helper missing %q", required)
@@ -235,21 +236,50 @@ func TestTrendRadarRuntimeScriptSafety(t *testing.T) {
 	}
 }
 
+func TestTrendRadarRuntimeUsesKeywordEntryWhenContentURLsAreEmpty(t *testing.T) {
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := strings.ToLower(readRuntimeScript(t, filepath.Join(root, "scripts", "Invoke-LtaooTrendRadarBatch.ps1")))
+	for _, required := range []string{
+		"$contenturls.count -eq 0",
+		"& $openscript -entryonly",
+		"wechat_channel_entry_sent",
+		"wechat_channel_home_open_failed",
+	} {
+		if !strings.Contains(entry, required) {
+			t.Errorf("keyword startup path missing %q", required)
+		}
+	}
+	if strings.Contains(entry, "if ([string]::isnullorwhitespace($firstshareurl)) { throw 'known_share_url_missing' }\n        $opencode") {
+		t.Fatal("keyword startup still requires a first share URL before choosing its entry path")
+	}
+}
+
 func TestKnownShareEntryTemplateIsValidBase64(t *testing.T) {
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filepath.Join(root, "scripts", "wechat-channel-entry-template.b64"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
-	if err != nil {
-		t.Fatalf("entry template is not valid base64: %v", err)
-	}
-	if len(decoded) < 8 || string(decoded[:8]) != "\x89PNG\r\n\x1a\n" {
-		t.Fatal("entry template is not a PNG")
+	for _, name := range []string{
+		"wechat-channel-entry-template.b64",
+		"wechat-discover-entry-active-template.b64",
+		"wechat-discover-entry-inactive-template.b64",
+		"wechat-channel-menu-active-template.b64",
+		"wechat-channel-menu-inactive-template.b64",
+	} {
+		raw, err := os.ReadFile(filepath.Join(root, "scripts", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+		if err != nil {
+			t.Fatalf("%s is not valid base64: %v", name, err)
+		}
+		if len(decoded) < 8 || string(decoded[:8]) != "\x89PNG\r\n\x1a\n" {
+			t.Fatalf("%s is not a PNG", name)
+		}
 	}
 }
 
