@@ -20,6 +20,9 @@ namespace TrendRadar {
         public const uint WM_KEYDOWN = 0x0100;
         public const uint WM_KEYUP = 0x0101;
         public const uint VK_RETURN = 0x0D;
+        public const uint VK_CONTROL = 0x11;
+        public const uint VK_L = 0x4C;
+        public const uint KEYEVENTF_KEYUP = 0x0002;
         public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
         public const uint MOUSEEVENTF_LEFTUP = 0x0004;
 
@@ -45,6 +48,7 @@ namespace TrendRadar {
         [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
         [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
 
         public static bool ActivateWindow(IntPtr hWnd, int command) {
@@ -103,29 +107,90 @@ function Get-TopLevelWindowsByProcessName {
     return @($windows)
 }
 
-function Get-GrayTemplateScore {
+function Get-AddressBarMatches {
+    param([Parameter(Mandatory = $true)][IntPtr]$HostHandle)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($HostHandle)
+    if ($null -eq $root) { return @() }
+    $editCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+    $matches = [System.Collections.Generic.List[object]]::new()
+    foreach ($edit in @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition))) {
+        $className = [string]$edit.Current.ClassName
+        $automationId = [string]$edit.Current.AutomationId
+        if ($className -ne 'OmniboxViewViews' -and $automationId -ne 'OmniboxViewViews') { continue }
+        $pattern = $null
+        if (-not $edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) { continue }
+        if ($edit.Current.IsEnabled -and -not $edit.Current.IsOffscreen -and -not $pattern.Current.IsReadOnly) {
+            $matches.Add([pscustomobject]@{ Element = $edit; Pattern = $pattern })
+        }
+    }
+    return @($matches)
+}
+
+function Get-WeChatWindows {
+    $windows = [System.Collections.Generic.List[object]]::new()
+    foreach ($processName in @('WeChatAppEx', 'Weixin', 'WeChat')) {
+        foreach ($window in @(Get-TopLevelWindowsByProcessName -ProcessName $processName)) {
+            $windows.Add($window)
+        }
+    }
+    return @($windows | Sort-Object HandleText -Unique)
+}
+
+function Select-WeChatMainWindow {
+    $windows = @(Get-WeChatWindows)
+    if ($windows.Count -eq 0) { throw 'wechat_window_not_found' }
+
+    # The browser host is the only reliable target for address-bar navigation.
+    $browserWindows = @($windows | Where-Object { @(Get-AddressBarMatches -HostHandle $_.Handle).Count -eq 1 })
+    if ($browserWindows.Count -eq 1) { return $browserWindows[0] }
+    if ($browserWindows.Count -gt 1) {
+        $browserWindows = @($browserWindows | Sort-Object @{Expression = { $_.Width * $_.Height }; Descending = $true })
+        if ($browserWindows.Count -gt 1 -and ($browserWindows[0].Width * $browserWindows[0].Height) -eq ($browserWindows[1].Width * $browserWindows[1].Height)) {
+            throw 'wechat_window_ambiguous'
+        }
+        return $browserWindows[0]
+    }
+
+    $legacyWindows = @($windows | Where-Object { $_.ProcessName -in @('Weixin', 'WeChat') })
+    if ($legacyWindows.Count -eq 1) { return $legacyWindows[0] }
+    if ($legacyWindows.Count -eq 0 -and $windows.Count -eq 1) { return $windows[0] }
+    throw 'wechat_window_ambiguous'
+}
+
+function Get-EdgeTemplateScore {
     param([Drawing.Bitmap]$Bitmap, [Drawing.Bitmap]$Template, [int]$CenterX, [int]$CenterY)
     $left = $CenterX - [int]($Template.Width / 2)
     $top = $CenterY - [int]($Template.Height / 2)
     if ($left -lt 0 -or $top -lt 0 -or ($left + $Template.Width) -gt $Bitmap.Width -or ($top + $Template.Height) -gt $Bitmap.Height) { return 0.0 }
-    $sum = 0.0
-    $count = 0
-    for ($y = 0; $y -lt $Template.Height; $y += 2) {
-        for ($x = 0; $x -lt $Template.Width; $x += 2) {
-            $a = $Bitmap.GetPixel($left + $x, $top + $y)
-            $b = $Template.GetPixel($x, $y)
-            $grayA = 0.299 * $a.R + 0.587 * $a.G + 0.114 * $a.B
-            $grayB = 0.299 * $b.R + 0.587 * $b.G + 0.114 * $b.B
-            $sum += [Math]::Abs($grayA - $grayB) / 255.0
-            $count++
+    $dot = 0.0; $bitmapEnergy = 0.0; $templateEnergy = 0.0
+    for ($y = 1; $y -lt ($Template.Height - 1); $y += 2) {
+        for ($x = 1; $x -lt ($Template.Width - 1); $x += 2) {
+            $bitmapLeft = $Bitmap.GetPixel($left + $x - 1, $top + $y)
+            $bitmapRight = $Bitmap.GetPixel($left + $x + 1, $top + $y)
+            $bitmapTop = $Bitmap.GetPixel($left + $x, $top + $y - 1)
+            $bitmapBottom = $Bitmap.GetPixel($left + $x, $top + $y + 1)
+            $templateLeft = $Template.GetPixel($x - 1, $y)
+            $templateRight = $Template.GetPixel($x + 1, $y)
+            $templateTop = $Template.GetPixel($x, $y - 1)
+            $templateBottom = $Template.GetPixel($x, $y + 1)
+            $bitmapGradient = [Math]::Abs((0.299 * ($bitmapRight.R - $bitmapLeft.R)) + (0.587 * ($bitmapRight.G - $bitmapLeft.G)) + (0.114 * ($bitmapRight.B - $bitmapLeft.B))) +
+                [Math]::Abs((0.299 * ($bitmapBottom.R - $bitmapTop.R)) + (0.587 * ($bitmapBottom.G - $bitmapTop.G)) + (0.114 * ($bitmapBottom.B - $bitmapTop.B)))
+            $templateGradient = [Math]::Abs((0.299 * ($templateRight.R - $templateLeft.R)) + (0.587 * ($templateRight.G - $templateLeft.G)) + (0.114 * ($templateRight.B - $templateLeft.B))) +
+                [Math]::Abs((0.299 * ($templateBottom.R - $templateTop.R)) + (0.587 * ($templateBottom.G - $templateTop.G)) + (0.114 * ($templateBottom.B - $templateTop.B)))
+            $dot += $bitmapGradient * $templateGradient
+            $bitmapEnergy += $bitmapGradient * $bitmapGradient
+            $templateEnergy += $templateGradient * $templateGradient
         }
     }
-    if ($count -eq 0) { return 0.0 }
-    return [Math]::Round(1.0 - ($sum / $count), 4)
+    if ($bitmapEnergy -le 0.0 -or $templateEnergy -le 0.0) { return 0.0 }
+    return [Math]::Round($dot / [Math]::Sqrt($bitmapEnergy * $templateEnergy), 4)
 }
 
 function Read-EntryTemplate {
-    $templatePath = Join-Path $PSScriptRoot 'wechat-channel-entry-template.b64'
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $templatePath = Join-Path $PSScriptRoot $Name
     if (-not [IO.File]::Exists($templatePath)) { throw 'wechat_entry_template_missing' }
     try {
         $bytes = [Convert]::FromBase64String(([IO.File]::ReadAllText($templatePath)).Trim())
@@ -138,6 +203,96 @@ function Read-EntryTemplate {
     } catch { throw 'wechat_entry_template_invalid' }
 }
 
+function Get-WindowBitmap {
+    param([Parameter(Mandatory = $true)][object]$Window)
+    $bitmap = [Drawing.Bitmap]::new($Window.Width, $Window.Height)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try { $graphics.CopyFromScreen($Window.Left, $Window.Top, 0, 0, $bitmap.Size) }
+    finally { $graphics.Dispose() }
+    return $bitmap
+}
+
+function Find-ScaledEntryTemplate {
+    param(
+        [Parameter(Mandatory = $true)][Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory = $true)][string[]]$TemplateNames,
+        [Parameter(Mandatory = $true)][double]$ReferenceX,
+        [Parameter(Mandatory = $true)][double]$ReferenceY,
+        [Parameter(Mandatory = $true)][double[]]$Scales,
+        [ValidateRange(0, 4)][int]$PixelRadius = 2
+    )
+    $templates = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($name in $TemplateNames) {
+            $sourceTemplate = Read-EntryTemplate -Name $name
+            try {
+                foreach ($scale in $Scales) {
+                    $width = [Math]::Max(8, [int][Math]::Round($sourceTemplate.Width * $scale))
+                    $height = [Math]::Max(8, [int][Math]::Round($sourceTemplate.Height * $scale))
+                    $scaled = [Drawing.Bitmap]::new($width, $height)
+                    $graphics = [Drawing.Graphics]::FromImage($scaled)
+                    try {
+                        $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                        $graphics.DrawImage($sourceTemplate, 0, 0, $width, $height)
+                    } finally { $graphics.Dispose() }
+                    $templates.Add([pscustomobject]@{ Name = $name; Scale = $scale; Bitmap = $scaled })
+                }
+            } finally { $sourceTemplate.Dispose() }
+        }
+
+        $coarseMatches = @(foreach ($template in $templates) {
+            $baseX = [int][Math]::Round($ReferenceX * $template.Scale)
+            $baseY = [int][Math]::Round($ReferenceY * $template.Scale)
+            [pscustomobject]@{
+                Template = $template
+                X = $baseX
+                Y = $baseY
+                Score = Get-EdgeTemplateScore -Bitmap $Bitmap -Template $template.Bitmap -CenterX $baseX -CenterY $baseY
+            }
+        })
+        $coarseMatches = @($coarseMatches | Sort-Object Score -Descending)
+        $refineCandidates = @($coarseMatches | Select-Object -First ([Math]::Min(2, $coarseMatches.Count)))
+        $matches = @(foreach ($candidate in $refineCandidates) {
+            $template = $candidate.Template
+            $baseX = $candidate.X
+            $baseY = $candidate.Y
+            for ($offsetX = -$PixelRadius; $offsetX -le $PixelRadius; $offsetX++) {
+                for ($offsetY = -$PixelRadius; $offsetY -le $PixelRadius; $offsetY++) {
+                    $score = Get-EdgeTemplateScore -Bitmap $Bitmap -Template $template.Bitmap -CenterX ($baseX + $offsetX) -CenterY ($baseY + $offsetY)
+                    [pscustomobject]@{
+                        X = $baseX + $offsetX; Y = $baseY + $offsetY
+                        TemplateName = $template.Name; TemplateScale = $template.Scale; TemplateScore = $score
+                        CombinedScore = [Math]::Round((0.98 * $score) + (0.02 * (1.0 - (([Math]::Abs($offsetX) + [Math]::Abs($offsetY)) / [Math]::Max(1.0, 2.0 * $PixelRadius)))), 4)
+                    }
+                }
+            }
+        })
+        $ranked = @($matches | Sort-Object CombinedScore -Descending)
+        $best = $ranked[0]
+        $best | Add-Member -NotePropertyName Margin -NotePropertyValue $(if ($ranked.Count -gt 1) { $best.CombinedScore - $ranked[1].CombinedScore } else { 1.0 })
+        return $best
+    } finally {
+        foreach ($template in $templates) { $template.Bitmap.Dispose() }
+    }
+}
+
+function Invoke-WindowClick {
+    param(
+        [Parameter(Mandatory = $true)][object]$Window,
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y
+    )
+    $cursor = [TrendRadar.WeChatChannelAutomation+POINT]::new()
+    [void][TrendRadar.WeChatChannelAutomation]::GetCursorPos([ref]$cursor)
+    [void][TrendRadar.WeChatChannelAutomation]::SetCursorPos(($Window.Left + $X), ($Window.Top + $Y))
+    Start-Sleep -Milliseconds 100
+    [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 250
+    [void][TrendRadar.WeChatChannelAutomation]::SetCursorPos($cursor.X, $cursor.Y)
+}
+
 function Test-ShareUrl {
     param([string]$Value)
     try { $uri = [Uri]$Value } catch { return $false }
@@ -147,11 +302,8 @@ function Test-ShareUrl {
 
 if (-not $EntryOnly -and -not (Test-ShareUrl -Value $ShareUrl)) { throw 'wechat_share_url_invalid' }
 
-$mainWindows = @(Get-TopLevelWindowsByProcessName -ProcessName 'Weixin')
-if ($mainWindows.Count -eq 0) { $mainWindows = @(Get-TopLevelWindowsByProcessName -ProcessName 'WeChat') }
-if ($mainWindows.Count -eq 0) { throw 'wechat_window_not_found' }
-if ($mainWindows.Count -ne 1) { throw 'wechat_window_ambiguous' }
-$main = $mainWindows[0]
+$main = Select-WeChatMainWindow
+$browserHostReady = @(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1
 
 if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($main.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_window_activation_failed' }
 Start-Sleep -Milliseconds 150
@@ -160,41 +312,47 @@ $rect = [TrendRadar.WeChatChannelAutomation+RECT]::new()
 $main.Left = $rect.Left; $main.Top = $rect.Top; $main.Width = $rect.Right - $rect.Left; $main.Height = $rect.Bottom - $rect.Top
 if ($main.Width -lt 500 -or $main.Height -lt 400) { throw 'wechat_window_invalid_size' }
 
-$bitmap = [Drawing.Bitmap]::new($main.Width, $main.Height)
-$template = $null
-try {
-    $graphics = [Drawing.Graphics]::FromImage($bitmap)
-    $graphics.CopyFromScreen($main.Left, $main.Top, 0, 0, $bitmap.Size)
-    $graphics.Dispose()
-    $template = Read-EntryTemplate
-    $matches = @(foreach ($xRatio in @(0.035, 0.042, 0.049)) {
-        foreach ($yRatio in @(0.44, 0.455, 0.47, 0.485, 0.50)) {
-            $cx = [int]($bitmap.Width * $xRatio); $cy = [int]($bitmap.Height * $yRatio)
-            $templateScore = Get-GrayTemplateScore -Bitmap $bitmap -Template $template -CenterX $cx -CenterY $cy
-            $geometryDistance = [Math]::Abs($xRatio - 0.042) + [Math]::Abs($yRatio - 0.47)
-            $geometryScore = [Math]::Round([Math]::Max(0.0, 1.0 - ($geometryDistance / 0.08)), 4)
-            [pscustomobject]@{ X = $cx; Y = $cy; TemplateScore = $templateScore; GeometryScore = $geometryScore; CombinedScore = [Math]::Round((0.6 * $templateScore) + (0.4 * $geometryScore), 4); GeometryPass = ($xRatio -ge 0.03 -and $xRatio -le 0.055 -and $yRatio -ge 0.43 -and $yRatio -le 0.51) }
-        }
-    })
-    $ranked = @($matches | Sort-Object CombinedScore -Descending)
-    $best = $ranked[0]
-    $margin = if ($ranked.Count -gt 1) { $best.CombinedScore - $ranked[1].CombinedScore } else { 1.0 }
-    Write-Verbose ("window={0} rect={1},{2} {3}x{4} best={5},{6} template={7} combined={8} margin={9}" -f $main.HandleText, $main.Left, $main.Top, $main.Width, $main.Height, $best.X, $best.Y, $best.TemplateScore, $best.CombinedScore, $margin)
-    if (-not $best.GeometryPass -or $best.TemplateScore -lt 0.88 -or $margin -lt 0.02) { throw 'wechat_entry_template_mismatch' }
+if (-not $browserHostReady) {
+    $bitmap = Get-WindowBitmap -Window $main
+    try {
+        $entryScales = @(0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+        $discover = Find-ScaledEntryTemplate -Bitmap $bitmap `
+            -TemplateNames @('wechat-discover-entry-active-template.b64', 'wechat-discover-entry-inactive-template.b64') `
+            -ReferenceX 59 -ReferenceY 512 -Scales $entryScales -PixelRadius 2
+        Write-Verbose ("discover-entry window={0} best={1},{2} template={3} scale={4} score={5} combined={6}" -f $main.HandleText, $discover.X, $discover.Y, $discover.TemplateName, $discover.TemplateScale, $discover.TemplateScore, $discover.CombinedScore)
+        if ($discover.TemplateScore -ge 0.84) {
+            Invoke-WindowClick -Window $main -X $discover.X -Y $discover.Y
 
-    $cursor = [TrendRadar.WeChatChannelAutomation+POINT]::new()
-    [void][TrendRadar.WeChatChannelAutomation]::GetCursorPos([ref]$cursor)
-    $absoluteX = $main.Left + $best.X; $absoluteY = $main.Top + $best.Y
-    [void][TrendRadar.WeChatChannelAutomation]::SetCursorPos($absoluteX, $absoluteY)
-    Start-Sleep -Milliseconds 100
-    [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 60
-    [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 250
-    [void][TrendRadar.WeChatChannelAutomation]::SetCursorPos($cursor.X, $cursor.Y)
-} finally {
-    if ($null -ne $template) { $template.Dispose() }
-    $bitmap.Dispose()
+            $channel = $null
+            for ($attempt = 0; $attempt -lt 10; $attempt++) {
+                Start-Sleep -Milliseconds 250
+                $menuBitmap = Get-WindowBitmap -Window $main
+                try {
+                    $channel = Find-ScaledEntryTemplate -Bitmap $menuBitmap `
+                        -TemplateNames @('wechat-channel-menu-active-template.b64', 'wechat-channel-menu-inactive-template.b64') `
+                        -ReferenceX 172 -ReferenceY 303 -Scales $entryScales -PixelRadius 2
+                } finally { $menuBitmap.Dispose() }
+                if ($channel.TemplateScore -ge 0.84) { break }
+                $channel = $null
+            }
+            if ($null -eq $channel) { throw 'wechat_channel_menu_not_ready' }
+            Write-Verbose ("channel-menu window={0} best={1},{2} template={3} scale={4} score={5} combined={6}" -f $main.HandleText, $channel.X, $channel.Y, $channel.TemplateName, $channel.TemplateScale, $channel.TemplateScore, $channel.CombinedScore)
+            Invoke-WindowClick -Window $main -X $channel.X -Y $channel.Y
+        } else {
+            $legacy = Find-ScaledEntryTemplate -Bitmap $bitmap -TemplateNames @('wechat-channel-entry-template.b64') `
+                -ReferenceX 78 -ReferenceY 617 -Scales $entryScales -PixelRadius 2
+            Write-Verbose ("legacy-entry window={0} best={1},{2} template={3} combined={4} margin={5}" -f $main.HandleText, $legacy.X, $legacy.Y, $legacy.TemplateScore, $legacy.CombinedScore, $legacy.Margin)
+            if ($legacy.TemplateScore -lt 0.75) { throw 'wechat_channel_entry_template_mismatch' }
+            Invoke-WindowClick -Window $main -X $legacy.X -Y $legacy.Y
+        }
+    } finally {
+        $bitmap.Dispose()
+    }
+}
+
+if ($EntryOnly -and -not $Refresh) {
+    'wechat_channel_entry_sent'
+    return
 }
 
 $webView = $null
@@ -258,32 +416,28 @@ if ($webViewTopLevel) {
 }
 
 if ($EntryOnly) {
-    if (-not $Refresh) { 'wechat_page_entry_verified'; return }
     if (-not [TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYDOWN, [IntPtr]0x74, [IntPtr]::Zero)) { throw 'wechat_page_refresh_failed' }
     [void][TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYUP, [IntPtr]0x74, [IntPtr]::Zero)
     'wechat_page_refresh_sent'
     return
 }
 
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($webViewRootHandle)
-$editCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-$edits = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition))
-$matches = @(foreach ($edit in $edits) {
-    $className = [string]$edit.Current.ClassName
-    $automationId = [string]$edit.Current.AutomationId
-    if ($className -ne 'OmniboxViewViews' -and $automationId -ne 'OmniboxViewViews') { continue }
-    $pattern = $null
-    if (-not $edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) { continue }
-    if ($edit.Current.IsEnabled -and -not $edit.Current.IsOffscreen -and -not $pattern.Current.IsReadOnly) { [pscustomobject]@{ Element = $edit; Pattern = $pattern } }
-})
+$matches = @(Get-AddressBarMatches -HostHandle $webViewRootHandle)
 if ($matches.Count -ne 1) { throw 'wechat_share_address_bar_not_ready' }
+$keyboardHostHandle = if ($webViewTopLevel) { $webView.Handle } else { $webViewRootHandle }
+if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($keyboardHostHandle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_webview_activation_failed' }
+Start-Sleep -Milliseconds 80
+[TrendRadar.WeChatChannelAutomation]::keybd_event([byte][TrendRadar.WeChatChannelAutomation]::VK_CONTROL, 0, 0, [UIntPtr]::Zero)
+[TrendRadar.WeChatChannelAutomation]::keybd_event([byte][TrendRadar.WeChatChannelAutomation]::VK_L, 0, 0, [UIntPtr]::Zero)
+[TrendRadar.WeChatChannelAutomation]::keybd_event([byte][TrendRadar.WeChatChannelAutomation]::VK_L, 0, [TrendRadar.WeChatChannelAutomation]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+[TrendRadar.WeChatChannelAutomation]::keybd_event([byte][TrendRadar.WeChatChannelAutomation]::VK_CONTROL, 0, [TrendRadar.WeChatChannelAutomation]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+Start-Sleep -Milliseconds 80
 $matches[0].Pattern.SetValue($ShareUrl)
 $enteredValue = [string]$matches[0].Pattern.Current.Value
 if ($enteredValue -cne $ShareUrl) { throw 'wechat_share_address_bar_write_failed' }
-if (-not [TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYDOWN, [IntPtr][TrendRadar.WeChatChannelAutomation]::VK_RETURN, [IntPtr]::Zero)) { throw 'wechat_share_navigation_failed' }
-[void][TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYUP, [IntPtr][TrendRadar.WeChatChannelAutomation]::VK_RETURN, [IntPtr]::Zero)
+[TrendRadar.WeChatChannelAutomation]::keybd_event([byte][TrendRadar.WeChatChannelAutomation]::VK_RETURN, 0, 0, [UIntPtr]::Zero)
+[TrendRadar.WeChatChannelAutomation]::keybd_event([byte][TrendRadar.WeChatChannelAutomation]::VK_RETURN, 0, [TrendRadar.WeChatChannelAutomation]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
 Start-Sleep -Milliseconds 1000
-$postNavigationPattern = $null
-if (-not $matches[0].Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$postNavigationPattern)) { throw 'wechat_share_navigation_not_verified' }
-if ([string]::IsNullOrWhiteSpace([string]$postNavigationPattern.Current.Value)) { throw 'wechat_share_navigation_not_verified' }
+$postNavigationMatches = @(Get-AddressBarMatches -HostHandle $webViewRootHandle)
+if ($postNavigationMatches.Count -ne 1 -or [string]$postNavigationMatches[0].Pattern.Current.Value -cne $ShareUrl) { throw 'wechat_share_navigation_not_verified' }
 'wechat_known_share_navigation_verified'

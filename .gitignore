@@ -182,6 +182,10 @@ scripts/*
 !scripts/LtaooRouter.psm1
 !scripts/LtaooRouter.Tests.ps1
 !scripts/trendradar_runtime_script_test.go
+!scripts/wechat-discover-entry-active-template.b64
+!scripts/wechat-discover-entry-inactive-template.b64
+!scripts/wechat-channel-menu-active-template.b64
+!scripts/wechat-channel-menu-inactive-template.b64
 
 # 测试文件应纳入版本控制（单元测试是源码的一部分）
 

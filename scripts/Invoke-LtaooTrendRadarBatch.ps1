@@ -38,6 +38,31 @@ function Get-ListenerAbsent {
     return @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in $Ports }).Count -eq 0
 }
 
+function Test-LtaooChannelsBridgeAvailable {
+    param([Parameter(Mandatory = $true)][string]$ApiBase)
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri ($ApiBase + '/api/channels/status') -TimeoutSec 2
+        if ([int]$response.StatusCode -ne 200) { return $false }
+        $body = $response.Content | ConvertFrom-Json
+        return $null -ne $body -and [int]$body.code -eq 0 -and $null -ne $body.data -and [bool]$body.data.available
+    } catch {
+        return $false
+    }
+}
+
+function Wait-LtaooChannelsBridge {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiBase,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$LtaooProcess
+    )
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        if ($LtaooProcess.HasExited) { return $false }
+        if (Test-LtaooChannelsBridgeAvailable -ApiBase $ApiBase) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
 function Stop-JournalLtaooProcess {
     param([Parameter(Mandatory = $true)][object]$Journal)
     $pidValue = [int]$Journal.ltaoo_pid
@@ -427,12 +452,20 @@ cert:
     if ($AutoOpenFirstShareUrl) {
         $currentStage = 'page_open'
         $openScript = Join-Path $PSScriptRoot 'Invoke-WeChatKnownShareOpen.ps1'
-        if (-not [IO.File]::Exists($openScript)) { throw 'known_share_open_helper_missing' }
-        $firstShareUrl = @($request.content_urls | ForEach-Object { [string]$_ })[0]
-        if ([string]::IsNullOrWhiteSpace($firstShareUrl)) { throw 'known_share_url_missing' }
-        $openCode = @(& $openScript -ShareUrl $firstShareUrl)
-        if ($openCode.Count -ne 1 -or [string]$openCode[0] -cne 'wechat_known_share_navigation_verified') {
-            throw 'known_share_open_failed'
+        if (-not [IO.File]::Exists($openScript)) { throw 'wechat_channel_open_helper_missing' }
+        $contentUrls = @($request.content_urls | ForEach-Object { [string]$_ })
+        if ($contentUrls.Count -eq 0) {
+            $openCode = @(& $openScript -EntryOnly)
+            if ($openCode.Count -ne 1 -or [string]$openCode[0] -cne 'wechat_channel_entry_sent') {
+                throw 'wechat_channel_home_open_failed'
+            }
+        } else {
+            $firstShareUrl = $contentUrls[0]
+            if ([string]::IsNullOrWhiteSpace($firstShareUrl)) { throw 'known_share_url_missing' }
+            $openCode = @(& $openScript -ShareUrl $firstShareUrl)
+            if ($openCode.Count -ne 1 -or [string]$openCode[0] -cne 'wechat_known_share_navigation_verified') {
+                throw 'known_share_open_failed'
+            }
         }
         Start-Sleep -Milliseconds 500
     } elseif ($AutoRefreshWechatPage) {
@@ -444,6 +477,13 @@ cert:
             throw 'wechat_page_refresh_failed'
         }
         Start-Sleep -Milliseconds 500
+    }
+
+    if ($AutoOpenFirstShareUrl -or $AutoRefreshWechatPage) {
+        $currentStage = 'page_bridge'
+        if (-not (Wait-LtaooChannelsBridge -ApiBase $apiBase -LtaooProcess $ltaooProcess)) { throw 'bridge_unavailable' }
+        $journal.phase = 'page_bridge_ready'
+        Write-LtaooJsonAtomic -Value $journal -LiteralPath $journalPath
     }
 
     $journal.phase = 'collecting'
