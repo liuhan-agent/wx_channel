@@ -14,7 +14,7 @@ func TestDefaultOptionsAreFixedToApprovedSpec(t *testing.T) {
 		got.Limits.RepliesPerWork != 200 {
 		t.Fatalf("unexpected defaults: %+v", got)
 	}
-	if got.HumanWait.Timeout != 300*time.Second || got.HumanWait.Extension != 300*time.Second || got.HumanWait.MaxExtensions != 1 {
+	if got.HumanWait.Timeout != 180*time.Second || got.HumanWait.Extension != 0 || got.HumanWait.MaxExtensions != 0 {
 		t.Fatalf("unexpected human wait: %+v", got.HumanWait)
 	}
 	if got.RequestInterval != time.Second {

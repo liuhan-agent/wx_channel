@@ -73,7 +73,7 @@ func TestSimulatedPOCOrdinaryFilesPassSecretScanner(t *testing.T) {
 
 func TestSimulatedPOCContextWaitTimeoutCleansUp(t *testing.T) {
 	clock := newManualClock()
-	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 300 * time.Second}, nil)
+	waiter := NewWaitController(clock, HumanWaitPolicy{Timeout: 180 * time.Second}, nil)
 	done := make(chan WaitResult, 1)
 	go func() { done <- waiter.Wait(context.Background(), WaitTargetContext, 1, nil) }()
 	clock.waitTimer(t)

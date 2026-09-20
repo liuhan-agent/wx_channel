@@ -61,14 +61,24 @@ same shared profile readiness window. If the bridge is not observed within that
 window, the batch records `profile_not_ready` and does not start comment
 pagination. This is a page-context failure, not a pagination failure.
 
-Runs may additionally opt in to `-AutoOpenFirstShareUrl`. This mode restores
-and foregrounds the PC WeChat host, checks the left navigation rail with a
-local butterfly-icon template plus normalized geometry, and performs one
-controlled click only after both checks pass. It then waits for a titled
-`WeChatAppEx` page, writes the first configured `content_urls` entry through
-the page's `OmniboxViewViews` value pattern, and submits Enter. The remaining
-configured links are still handled by the same batch/profile bridge; they are
-not opened one by one. The mode is mutually exclusive with
+Runs may additionally opt in to `-AutoOpenFirstShareUrl`. Despite the legacy
+switch name, this is the general automatic Channels startup mode. It restores
+and foregrounds the PC WeChat host and supports both known entry layouts:
+
+- the legacy left-rail butterfly opens Channels directly;
+- the current layout opens Discover through the compass icon, then selects the
+  butterfly icon in the second-level Channels row.
+
+Both layouts require local edge/template evidence plus scale-coupled geometry
+before either click. For keyword-discovery requests with no `content_urls`,
+the helper stops after sending the verified entry clicks; the runtime then
+requires the Channels page bridge to become available before the batch performs
+the existing `finderSearch` flow with the request `keyword`. A share link is
+not required. When `content_urls` is
+non-empty, the helper additionally writes the first configured URL through an
+available `OmniboxViewViews` value pattern and submits Enter. The remaining
+configured links are handled by the same batch/profile bridge and are not
+opened one by one. The mode is mutually exclusive with
 `-AutoRefreshWechatPage`, and all navigation failures are closed errors that
 enter normal cleanup. No OCR, clipboard, browser automation, or model API is
 used. Window activation is DPI-aware and uses a temporary foreground-input
