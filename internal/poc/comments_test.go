@@ -43,7 +43,7 @@ func TestCollectCommentsMapsTopLevelAndReplies(t *testing.T) {
 		t.Fatalf("embedded duplicate was not removed: %+v", comments)
 	}
 	for _, comment := range comments {
-		if comment.CommentID == nil && comment.Content.MediaType.Normalized != "image" {
+		if comment.CommentID == nil && !containsString(comment.Content.MediaTypes, "image") {
 			t.Fatalf("missing-ID media comment=%+v", comment)
 		}
 	}
@@ -272,11 +272,11 @@ func TestRepliesStopAt100PerCommentAndMarksTruncated(t *testing.T) {
 	replies := make([]map[string]any, 101)
 	for index := range replies {
 		replies[index] = map[string]any{
-			"commentId": fmt.Sprintf("fixture-expanded-reply-%03d", index+1),
+			"commentId":      fmt.Sprintf("fixture-expanded-reply-%03d", index+1),
 			"replyCommentId": "fixture-expanded-root",
-			"rootCommentId": "fixture-expanded-root",
-			"content": "fixture-expanded-reply-limit",
-			"contentType": 1,
+			"rootCommentId":  "fixture-expanded-root",
+			"content":        "fixture-expanded-reply-limit",
+			"contentType":    1,
 		}
 	}
 	options := approvedTestOptions()
@@ -389,7 +389,7 @@ func TestReplyLimitsMustBothBeZeroOrPositive(t *testing.T) {
 func TestParentAndRootRemainNullWhenSourceOmitsThem(t *testing.T) {
 	workID := "fixture-work-5"
 	retrievalRoot := "fixture-retrieval-root"
-	comment, _ := mapComment(map[string]any{
+	comment, _, _ := mapComment(map[string]any{
 		"commentId": "fixture-reply-without-relations",
 		"content":   "fixture-reply",
 	}, 2, &workID, &retrievalRoot, SourceRef{Method: commentListMethod, EvidenceRef: "evidence/fixture.json", Ordinal: 1})
@@ -400,7 +400,7 @@ func TestParentAndRootRemainNullWhenSourceOmitsThem(t *testing.T) {
 		t.Fatalf("retrieval root=%v", comment.RetrievalRootCommentID)
 	}
 
-	zero, _ := mapComment(map[string]any{"replyCommentId": "0", "rootCommentId": "0"}, 2, &workID, nil, SourceRef{})
+	zero, _, _ := mapComment(map[string]any{"replyCommentId": "0", "rootCommentId": "0"}, 2, &workID, nil, SourceRef{})
 	if zero.ParentCommentID != nil || zero.RootCommentID != nil {
 		t.Fatalf("zero relations were not normalized: %+v", zero)
 	}
@@ -408,7 +408,7 @@ func TestParentAndRootRemainNullWhenSourceOmitsThem(t *testing.T) {
 
 func TestIPRegionAndTimePreserveRawSourceSemantics(t *testing.T) {
 	workID := "fixture-work-6"
-	valid, fields := mapComment(map[string]any{
+	valid, _, fields := mapComment(map[string]any{
 		"createtime":   "1715760000",
 		"ipRegion":     "fixture-fallback-region",
 		"ipRegionInfo": map[string]any{"regionText": "fixture-primary-region"},
@@ -423,7 +423,7 @@ func TestIPRegionAndTimePreserveRawSourceSemantics(t *testing.T) {
 		t.Fatalf("IP/time fields=%+v results=%+v", valid, fields)
 	}
 
-	invalid, invalidFields := mapComment(map[string]any{"createtime": "fixture-not-unix", "ipRegion": "fixture-fallback-region"}, 1, &workID, nil, SourceRef{})
+	invalid, _, invalidFields := mapComment(map[string]any{"createtime": "fixture-not-unix", "ipRegion": "fixture-fallback-region"}, 1, &workID, nil, SourceRef{})
 	if dereference(invalid.CreatedAt.Raw) != "fixture-not-unix" || invalid.CreatedAt.UnixSeconds != nil || invalid.CreatedAt.ISO8601 != nil {
 		t.Fatalf("invalid time semantics=%+v", invalid.CreatedAt)
 	}

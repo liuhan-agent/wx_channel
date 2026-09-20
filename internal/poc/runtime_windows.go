@@ -280,7 +280,7 @@ func outcomeFromCollection(coverage CoverageStatus, works []Work, completed int,
 func requiredFieldStatuses(comments []Comment) map[string]FieldStatus {
 	statuses := map[string]FieldStatus{
 		"comment_id": FieldPresent, "content": FieldPresent, "account": FieldPresent,
-		"time": FieldPresent, "ip_location": FieldPresent, "media_type": FieldPresent,
+		"time": FieldPresent, "ip_location": FieldPresent, "media_types": FieldPresent,
 	}
 	for _, comment := range comments {
 		if comment.CommentID == nil {
@@ -298,8 +298,8 @@ func requiredFieldStatuses(comments []Comment) map[string]FieldStatus {
 		if comment.IPLocation.Label == nil {
 			statuses["ip_location"] = FieldMissingInSource
 		}
-		if comment.Content.MediaType.RawCode == nil {
-			statuses["media_type"] = FieldMissingInSource
+		if len(comment.Content.MediaTypes) == 0 {
+			statuses["media_types"] = FieldMissingInSource
 		}
 	}
 	return statuses
@@ -308,7 +308,7 @@ func requiredFieldStatuses(comments []Comment) map[string]FieldStatus {
 func validationFields(comments []Comment) []FieldResult {
 	statuses := requiredFieldStatuses(comments)
 	fields := make([]FieldResult, 0, len(statuses))
-	for _, name := range []string{"comment_id", "content", "account", "time", "ip_location", "media_type"} {
+	for _, name := range []string{"comment_id", "content", "account", "time", "ip_location", "media_types"} {
 		fields = append(fields, fieldResult("comments[]."+name, statuses[name]))
 	}
 	return fields

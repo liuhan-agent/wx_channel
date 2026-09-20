@@ -107,8 +107,9 @@ type Work struct {
 }
 
 type CommentContent struct {
-	Text      *string   `json:"text"`
-	MediaType MediaType `json:"media_type"`
+	Text       *string  `json:"text"`
+	MediaTypes []string `json:"media_types"`
+	MediaRef   string   `json:"media_ref"`
 }
 
 type CommentTime struct {

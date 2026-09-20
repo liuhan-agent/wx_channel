@@ -42,6 +42,7 @@ type Collector struct {
 	waiter          *WaitController
 	readySignal     func(WaitReason, int) <-chan struct{}
 	currentWorkRank int
+	mediaCandidates []commentMediaCandidate
 }
 
 type searchContact struct {
@@ -58,6 +59,22 @@ type searchPage struct {
 
 func NewCollector(api PageAPI, evidence *EvidenceRecorder, store CollectorStore, clock Clock) *Collector {
 	return &Collector{api: api, evidence: evidence, store: store, clock: clock, retryPolicy: DefaultRetryPolicy()}
+}
+
+func (c *Collector) appendCommentMediaCandidates(candidates []commentMediaCandidate) {
+	if c == nil || len(candidates) == 0 {
+		return
+	}
+	c.mediaCandidates = append(c.mediaCandidates, candidates...)
+}
+
+func (c *Collector) drainCommentMediaCandidates() []commentMediaCandidate {
+	if c == nil || len(c.mediaCandidates) == 0 {
+		return nil
+	}
+	candidates := append([]commentMediaCandidate(nil), c.mediaCandidates...)
+	c.mediaCandidates = nil
+	return candidates
 }
 
 func (c *Collector) ConfigureHumanWait(waiter *WaitController, readySignal func(WaitReason, int) <-chan struct{}) {

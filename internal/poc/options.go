@@ -31,9 +31,7 @@ func DefaultOptions() Options {
 			RepliesPerWork:          200,
 		},
 		HumanWait: HumanWaitPolicy{
-			Timeout:       300 * time.Second,
-			Extension:     300 * time.Second,
-			MaxExtensions: 1,
+			Timeout: 180 * time.Second,
 		},
 		RequestInterval: time.Second,
 		ProxyAddress:    "127.0.0.1:2025",
@@ -55,7 +53,7 @@ func (o Options) ValidateForRun() error {
 	if o.Limits != (Limits{Works: 10, TopLevelCommentsPerWork: 100, RepliesPerComment: 20, RepliesPerWork: 200}) {
 		return errors.New("limits differ from approved spec")
 	}
-	if o.HumanWait.Timeout != 300*time.Second || o.HumanWait.Extension != 300*time.Second || o.HumanWait.MaxExtensions != 1 {
+	if o.HumanWait.Timeout != 180*time.Second || o.HumanWait.Extension != 0 || o.HumanWait.MaxExtensions != 0 {
 		return errors.New("human wait policy differs from approved spec")
 	}
 	if o.RequestInterval != time.Second {

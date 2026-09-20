@@ -3,12 +3,15 @@ package poc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -130,11 +133,12 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 			ordinal++
 			source := pageSource
 			source.Ordinal = ordinal
-			comment, _ := mapComment(item, 1, work.WorkID, nil, source)
+			comment, mediaCandidates, _ := mapComment(item, 1, work.WorkID, nil, source)
 			if !acceptCommentID(comment.CommentID, source, topSeen, missingSeen) {
 				continue
 			}
 			comments = append(comments, comment)
+			c.appendCommentMediaCandidates(mediaCandidates)
 			summary.TopLevel++
 			acceptedOnPage++
 
@@ -147,7 +151,7 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 				ordinal++
 				childSource := pageSource
 				childSource.Ordinal = ordinal
-				reply, _ := mapComment(child, 2, work.WorkID, comment.CommentID, childSource)
+				reply, mediaCandidates, _ := mapComment(child, 2, work.WorkID, comment.CommentID, childSource)
 				if reply.CommentID != nil {
 					if _, duplicate := replySeen[*reply.CommentID]; duplicate {
 						continue
@@ -160,6 +164,7 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 					continue
 				}
 				comments = append(comments, reply)
+				c.appendCommentMediaCandidates(mediaCandidates)
 				summary.Replies++
 				repliesByRoot[rootID]++
 				acceptedOnPage++
@@ -250,7 +255,7 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 			for index, item := range items {
 				source := pageSource
 				source.Ordinal = index + 1
-				reply, _ := mapComment(item, 2, work.WorkID, &root.id, source)
+				reply, mediaCandidates, _ := mapComment(item, 2, work.WorkID, &root.id, source)
 				if reply.CommentID != nil {
 					if _, duplicate := replySeen[*reply.CommentID]; duplicate {
 						continue
@@ -263,6 +268,7 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 					continue
 				}
 				comments = append(comments, reply)
+				c.appendCommentMediaCandidates(mediaCandidates)
 				summary.Replies++
 				repliesByRoot[root.id]++
 				acceptedOnPage++
@@ -342,7 +348,18 @@ func reportedCount(data map[string]any) int {
 	return 0
 }
 
-func mapComment(item map[string]any, level int, workID *string, retrievalRoot *string, source SourceRef) (Comment, []FieldResult) {
+type commentMediaCandidate struct {
+	commentRef string
+	mediaType  string
+	ordinal    int
+	directURL  string
+	cipherURL  string
+	aesKey     string
+}
+
+func mapComment(item map[string]any, level int, workID *string, retrievalRoot *string, source SourceRef) (Comment, []commentMediaCandidate, []FieldResult) {
+	text, textPresent := stringField(item, "content")
+	mediaTypes := mediaTypesForComment(item, text)
 	comment := Comment{
 		CommentID:              normalizedRelation(item, "commentId"),
 		WorkID:                 cloneStringPointer(workID),
@@ -351,12 +368,11 @@ func mapComment(item map[string]any, level int, workID *string, retrievalRoot *s
 		RootCommentID:          normalizedRelation(item, "rootCommentId"),
 		RetrievalRootCommentID: cloneStringPointer(retrievalRoot),
 		Content: CommentContent{
-			MediaType: mapCommentMedia(item),
+			MediaTypes: mediaTypes,
 		},
 		Source: source,
 	}
 
-	text, textPresent := stringField(item, "content")
 	textStatus := FieldMissingInSource
 	if textPresent {
 		comment.Content.Text, textStatus = RedactString(text)
@@ -388,25 +404,131 @@ func mapComment(item map[string]any, level int, workID *string, retrievalRoot *s
 	if comment.IPLocation.Label == nil {
 		comment.IPLocation.Label = optionalString(item, "ipRegion")
 	}
+	if containsString(mediaTypes, "image") || containsString(mediaTypes, "sticker") {
+		comment.Content.MediaRef = commentMediaRef(comment, source)
+	}
+	mediaCandidates := extractCommentMediaCandidates(item, comment.Content.MediaRef)
 
 	results := []FieldResult{
 		fieldResult("comments[].content.text", textStatus),
+		fieldResult("comments[].content.media_types", FieldPresent),
 		fieldResult("comments[].account.avatar_url", avatarStatus),
 		fieldResult("comments[].created_at", timeStatus),
 		fieldResult("comments[].ip_location.label", pointerStatus(comment.IPLocation.Label)),
 	}
-	return comment, results
+	return comment, mediaCandidates, results
 }
 
-func mapCommentMedia(item map[string]any) MediaType {
-	media := MediaType{RawCode: item["contentType"], Normalized: "unknown"}
-	switch fmt.Sprint(media.RawCode) {
-	case "1":
-		media.Normalized = "text"
-	case "2":
-		media.Normalized = "image"
+func mediaTypesForComment(item map[string]any, text string) []string {
+	mediaTypes := make([]string, 0, 3)
+	if strings.TrimSpace(text) != "" {
+		mediaTypes = append(mediaTypes, "text")
 	}
-	return media
+	if nonEmptyCommentInfoArray(item, "imageInfos") {
+		mediaTypes = append(mediaTypes, "image")
+	}
+	if nonEmptyCommentInfoArray(item, "emoticonInfos") {
+		mediaTypes = append(mediaTypes, "sticker")
+	}
+	switch fmt.Sprint(item["contentType"]) {
+	case "1":
+		if len(mediaTypes) == 0 {
+			mediaTypes = append(mediaTypes, "text")
+		}
+	case "2":
+		if !containsString(mediaTypes, "image") {
+			mediaTypes = append(mediaTypes, "image")
+		}
+	default:
+		if len(mediaTypes) == 0 {
+			mediaTypes = append(mediaTypes, "unknown_non_text")
+		}
+	}
+	return mediaTypes
+}
+
+func nonEmptyCommentInfoArray(item map[string]any, key string) bool {
+	contentInfo, ok := item["contentInfo"].(map[string]any)
+	if !ok {
+		return false
+	}
+	values, ok := contentInfo[key].([]any)
+	return ok && len(values) > 0
+}
+
+func extractCommentMediaCandidates(item map[string]any, commentRef string) []commentMediaCandidate {
+	if commentRef == "" {
+		return nil
+	}
+	contentInfo, ok := item["contentInfo"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	candidates := make([]commentMediaCandidate, 0)
+	for _, group := range []struct {
+		key       string
+		mediaType string
+	}{{"imageInfos", "image"}, {"emoticonInfos", "sticker"}} {
+		values, ok := contentInfo[group.key].([]any)
+		if !ok {
+			continue
+		}
+		for index, value := range values {
+			descriptor, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			candidate := commentMediaCandidate{
+				commentRef: commentRef,
+				mediaType:  group.mediaType,
+				ordinal:    index,
+				directURL:  commentMediaString(descriptor, "Url"),
+				cipherURL:  commentMediaString(descriptor, "EncryptUrl"),
+				aesKey:     commentMediaString(descriptor, "AesKey"),
+			}
+			if candidate.directURL == "" && candidate.cipherURL == "" {
+				continue
+			}
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates
+}
+
+func commentMediaString(descriptor map[string]any, key string) string {
+	value, ok := descriptor[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func commentMediaRef(comment Comment, source SourceRef) string {
+	identity := dereferenceString(comment.CommentID)
+	if identity == "" {
+		identity = strings.Join([]string{
+			dereferenceString(comment.WorkID),
+			strconv.Itoa(comment.Level),
+			dereferenceString(comment.ParentCommentID),
+			dereferenceString(comment.RootCommentID),
+			dereferenceString(comment.Content.Text),
+			dereferenceString(comment.CreatedAt.Raw),
+			dereferenceString(comment.Account.AccountID),
+			source.Method,
+			strconv.Itoa(source.Ordinal),
+		}, "\x1f")
+	}
+	digest := sha256.Sum256([]byte("wechat-comment-media-ref\x00" + dereferenceString(comment.WorkID) + "\x00" + identity))
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func childComments(item map[string]any) []map[string]any {

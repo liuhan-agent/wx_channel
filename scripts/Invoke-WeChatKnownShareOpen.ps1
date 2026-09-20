@@ -76,6 +76,15 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 [void][TrendRadar.WeChatChannelAutomation]::SetProcessDPIAware()
 
+function Invoke-WeChatLaunchFinder {
+    try {
+        Start-Process -FilePath 'weixin://launchfinder' -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Get-TopLevelWindowsByProcessName {
     param([Parameter(Mandatory = $true)][string]$ProcessName)
     $windows = [System.Collections.Generic.List[object]]::new()
@@ -157,6 +166,84 @@ function Select-WeChatMainWindow {
     if ($legacyWindows.Count -eq 1) { return $legacyWindows[0] }
     if ($legacyWindows.Count -eq 0 -and $windows.Count -eq 1) { return $windows[0] }
     throw 'wechat_window_ambiguous'
+}
+
+function Invoke-VisibleWeChatConfirmationButtons {
+    param([Parameter(Mandatory = $true)][IntPtr]$HostHandle)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($HostHandle)
+    if ($null -eq $root) { return $false }
+    $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $clicked = $false
+    foreach ($button in @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition))) {
+        $name = [string]$button.Current.Name
+        if ($name -notin @('我知道了', '进入微信') -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen) { continue }
+        $invoke = $null
+        if ($button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+            $invoke.Invoke()
+            $clicked = $true
+            Start-Sleep -Milliseconds 350
+            continue
+        }
+        $rect = $button.Current.BoundingRectangle
+        if ($rect.Width -le 0 -or $rect.Height -le 0) { continue }
+        [void][TrendRadar.WeChatChannelAutomation]::SetCursorPos(
+            [int][Math]::Round($rect.Left + ($rect.Width / 2)),
+            [int][Math]::Round($rect.Top + ($rect.Height / 2)))
+        [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+        [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+        $clicked = $true
+        Start-Sleep -Milliseconds 350
+    }
+    return $clicked
+}
+
+function Write-ManualInterventionProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [Parameter(Mandatory = $true)][datetime]$StartedAt,
+        [Parameter(Mandatory = $true)][datetime]$DeadlineAt,
+        [Parameter(Mandatory = $true)][bool]$ForegroundAttempted
+    )
+    $pathValue = [Environment]::GetEnvironmentVariable('TRENDRADAR_MANUAL_INTERVENTION_PROGRESS_PATH')
+    if ([string]::IsNullOrWhiteSpace($pathValue)) { return }
+    $path = [IO.Path]::GetFullPath($pathValue)
+    if ([IO.Path]::GetFileName($path) -cne 'manual-intervention.json' -or -not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($path))) { return }
+    if ($null -eq (Get-Variable -Name ManualInterventionSequence -Scope Script -ErrorAction SilentlyContinue)) {
+        $priorSequence = 0
+        if ([IO.File]::Exists($path)) {
+            try { $priorSequence = [int]((Get-Content -Raw -LiteralPath $path | ConvertFrom-Json).sequence) } catch { $priorSequence = 0 }
+        }
+        $script:ManualInterventionSequence = $priorSequence + 1
+    }
+    $payload = [ordered]@{
+        schema_version = 'manual-intervention-progress/1'
+        sequence = $script:ManualInterventionSequence
+        phase = $Phase
+        platform = 'wechat_channels'
+        reason = $Reason
+        started_at = $StartedAt.ToUniversalTime().ToString('o')
+        deadline_at = $DeadlineAt.ToUniversalTime().ToString('o')
+        foreground_attempted = $ForegroundAttempted
+    }
+    $temporary = Join-Path ([IO.Path]::GetDirectoryName($path)) ('.manual-intervention.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($temporary, ($payload | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+        if ([IO.File]::Exists($path)) {
+            [IO.File]::Replace($temporary, $path, $null, $true)
+        } else {
+            [IO.File]::Move($temporary, $path)
+        }
+    } catch {
+        try {
+            if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+            [IO.File]::Move($temporary, $path)
+        } catch { }
+    } finally {
+        if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    }
 }
 
 function Get-EdgeTemplateScore {
@@ -302,7 +389,34 @@ function Test-ShareUrl {
 
 if (-not $EntryOnly -and -not (Test-ShareUrl -Value $ShareUrl)) { throw 'wechat_share_url_invalid' }
 
-$main = Select-WeChatMainWindow
+# Protocol activation is the primary path. Existing geometry/template logic remains
+# below as a compatibility fallback for old WeChat builds.
+[void](Invoke-WeChatLaunchFinder)
+$main = $null
+for ($attempt = 0; $attempt -lt 30 -and $null -eq $main; $attempt++) {
+    try { $main = Select-WeChatMainWindow } catch { Start-Sleep -Milliseconds 500 }
+}
+if ($null -eq $main) { throw 'wechat_window_not_found' }
+if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($main.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_window_activation_failed' }
+Start-Sleep -Milliseconds 150
+$manualStartedAt = [DateTime]::UtcNow
+$manualDeadlineAt = $manualStartedAt.AddSeconds(180)
+$foregroundAttempted = $true
+$clickedConfirmation = Invoke-VisibleWeChatConfirmationButtons -HostHandle $main.Handle
+if ($clickedConfirmation) {
+    Write-ManualInterventionProgress -Phase 'waiting_for_human' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+    while ([DateTime]::UtcNow -lt $manualDeadlineAt) {
+        if (@(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1) { break }
+        [void](Invoke-VisibleWeChatConfirmationButtons -HostHandle $main.Handle)
+        Start-Sleep -Milliseconds 500
+    }
+    if (@(Get-AddressBarMatches -HostHandle $main.Handle).Count -ne 1) {
+        Write-ManualInterventionProgress -Phase 'timed_out' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+        throw 'wechat_entry_confirmation_timeout'
+    }
+    Write-ManualInterventionProgress -Phase 'resumed' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+}
+
 $browserHostReady = @(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1
 
 if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($main.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_window_activation_failed' }
@@ -313,9 +427,11 @@ $main.Left = $rect.Left; $main.Top = $rect.Top; $main.Width = $rect.Right - $rec
 if ($main.Width -lt 500 -or $main.Height -lt 400) { throw 'wechat_window_invalid_size' }
 
 if (-not $browserHostReady) {
-    $bitmap = Get-WindowBitmap -Window $main
+    $compatibilityFailure = $null
     try {
-        $entryScales = @(0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+        $bitmap = Get-WindowBitmap -Window $main
+        try {
+            $entryScales = @(0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
         $discover = Find-ScaledEntryTemplate -Bitmap $bitmap `
             -TemplateNames @('wechat-discover-entry-active-template.b64', 'wechat-discover-entry-inactive-template.b64') `
             -ReferenceX 59 -ReferenceY 512 -Scales $entryScales -PixelRadius 2
@@ -345,8 +461,23 @@ if (-not $browserHostReady) {
             if ($legacy.TemplateScore -lt 0.75) { throw 'wechat_channel_entry_template_mismatch' }
             Invoke-WindowClick -Window $main -X $legacy.X -Y $legacy.Y
         }
-    } finally {
-        $bitmap.Dispose()
+        } finally {
+            $bitmap.Dispose()
+        }
+    } catch {
+        $compatibilityFailure = $_.Exception
+    }
+    if ($null -ne $compatibilityFailure) {
+        Write-ManualInterventionProgress -Phase 'waiting_for_human' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+        while ([DateTime]::UtcNow -lt $manualDeadlineAt) {
+            if (@(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (@(Get-AddressBarMatches -HostHandle $main.Handle).Count -ne 1) {
+            Write-ManualInterventionProgress -Phase 'timed_out' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+            throw 'wechat_entry_confirmation_timeout'
+        }
+        Write-ManualInterventionProgress -Phase 'resumed' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
     }
 }
 
