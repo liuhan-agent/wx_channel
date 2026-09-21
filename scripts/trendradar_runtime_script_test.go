@@ -193,7 +193,7 @@ func TestTrendRadarRuntimeScriptSafety(t *testing.T) {
 	}
 	for _, required := range []string{
 		"showwindow", "setforegroundwindow", "activatewindow", "attachthreadinput", "setprocessdpiaware", "mouse_event", "wechat_entry_template", "uiautomationclient",
-		"omniboxviewviews", "setvalue", "postmessage", "keybd_event", "get-addressbarmatches", "select-wechatmainwindow", "wechat_known_share_navigation_verified", "wechat_channel_entry_template_mismatch", "wechat_channel_menu_not_ready", "wechatappex", "wechatembeddedwebview", "wechat_webview_not_ready", "wechat_webview_ambiguous",
+		"omniboxviewviews", "setvalue", "postmessage", "keybd_event", "get-addressbarmatches", "get-visiblewechatconfirmationbuttons", "select-wechatmainwindow", "wechat_known_share_navigation_verified", "wechat_channel_entry_template_mismatch", "wechat_channel_menu_not_ready", "wechatappex", "wechatembeddedwebview", "wechat_webview_not_ready", "wechat_webview_ambiguous",
 	} {
 		if !strings.Contains(strings.ToLower(open), required) {
 			t.Errorf("known-share helper missing %q", required)
@@ -254,6 +254,19 @@ func TestTrendRadarRuntimeUsesKeywordEntryWhenContentURLsAreEmpty(t *testing.T) 
 	}
 	if strings.Contains(entry, "if ([string]::isnullorwhitespace($firstshareurl)) { throw 'known_share_url_missing' }\n        $opencode") {
 		t.Fatal("keyword startup still requires a first share URL before choosing its entry path")
+	}
+	open := strings.ToLower(readRuntimeScript(t, filepath.Join(root, "scripts", "Invoke-WeChatKnownShareOpen.ps1")))
+	for _, required := range []string{
+		"if ($entryonly -and $clickedconfirmation)",
+		"$browserhostready = if ($entryonly) {",
+		"'wechat_channel_entry_sent'",
+	} {
+		if !strings.Contains(open, required) {
+			t.Errorf("keyword entry flow missing %q", required)
+		}
+	}
+	if !strings.Contains(open, "[trendradar.wechatchannelautomation]::postmessage") {
+		t.Fatal("entry-only path must refresh the selected Channels WebView through the window message")
 	}
 }
 

@@ -76,6 +76,11 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 [void][TrendRadar.WeChatChannelAutomation]::SetProcessDPIAware()
 
+# Build the localized labels from code points so Windows PowerShell 5.1 can
+# read this UTF-8-without-BOM script without turning them into mojibake.
+$script:WeChatAcknowledgedButtonName = -join [char[]](0x6211, 0x77e5, 0x9053, 0x4E86)
+$script:WeChatEntryButtonName = -join [char[]](0x8FDB, 0x5165, 0x5FAE, 0x4FE1)
+
 function Invoke-WeChatLaunchFinder {
     try {
         Start-Process -FilePath 'weixin://launchfinder' -ErrorAction Stop | Out-Null
@@ -143,23 +148,82 @@ function Get-WeChatWindows {
         foreach ($window in @(Get-TopLevelWindowsByProcessName -ProcessName $processName)) {
             $windows.Add($window)
         }
+        foreach ($process in @(Get-Process -Name $processName -ErrorAction SilentlyContinue)) {
+            $handle = $process.MainWindowHandle
+            if ($handle -eq [IntPtr]::Zero -or @($windows | Where-Object { $_.Handle -eq $handle }).Count -gt 0) { continue }
+            $rect = [TrendRadar.WeChatChannelAutomation+RECT]::new()
+            [void][TrendRadar.WeChatChannelAutomation]::GetWindowRect($handle, [ref]$rect)
+            $title = [string]$process.MainWindowTitle
+            if (-not [TrendRadar.WeChatChannelAutomation]::IsWindowVisible($handle) -or [string]::IsNullOrWhiteSpace($title)) { continue }
+            $windows.Add([pscustomobject]@{
+                Handle = $handle
+                HandleText = ('0x{0:X}' -f $handle.ToInt64())
+                Title = $title
+                ProcessName = $process.ProcessName
+                Minimized = [TrendRadar.WeChatChannelAutomation]::IsIconic($handle)
+                Left = $rect.Left
+                Top = $rect.Top
+                Width = $rect.Right - $rect.Left
+                Height = $rect.Bottom - $rect.Top
+            })
+        }
     }
     return @($windows | Sort-Object HandleText -Unique)
 }
 
 function Select-WeChatMainWindow {
+    param([switch]$EntryOnly)
     $windows = @(Get-WeChatWindows)
     if ($windows.Count -eq 0) { throw 'wechat_window_not_found' }
 
-    # The browser host is the only reliable target for address-bar navigation.
-    $browserWindows = @($windows | Where-Object { @(Get-AddressBarMatches -HostHandle $_.Handle).Count -eq 1 })
-    if ($browserWindows.Count -eq 1) { return $browserWindows[0] }
-    if ($browserWindows.Count -gt 1) {
-        $browserWindows = @($browserWindows | Sort-Object @{Expression = { $_.Width * $_.Height }; Descending = $true })
-        if ($browserWindows.Count -gt 1 -and ($browserWindows[0].Width * $browserWindows[0].Height) -eq ($browserWindows[1].Width * $browserWindows[1].Height)) {
+    $namedWindows = @($windows | Where-Object {
+        $_.ProcessName -eq 'Weixin' -and ([string]$_.Title).Trim() -notmatch '^Weixin$'
+    })
+    if ($EntryOnly) {
+        if ($namedWindows.Count -eq 1) { return $namedWindows[0] }
+        if ($namedWindows.Count -gt 1) {
             throw 'wechat_window_ambiguous'
         }
-        return $browserWindows[0]
+    }
+
+    if (-not $EntryOnly) {
+        # The browser host is the only reliable target for address-bar navigation.
+        $browserWindows = @($windows | Where-Object {
+            try { @(Get-AddressBarMatches -HostHandle $_.Handle).Count -eq 1 } catch { $false }
+        })
+        if ($browserWindows.Count -eq 1) { return $browserWindows[0] }
+        if ($browserWindows.Count -gt 1) {
+            $browserWindows = @($browserWindows | Sort-Object @{Expression = { $_.Width * $_.Height }; Descending = $true })
+            if ($browserWindows.Count -gt 1 -and ($browserWindows[0].Width * $browserWindows[0].Height) -eq ($browserWindows[1].Width * $browserWindows[1].Height)) {
+                throw 'wechat_window_ambiguous'
+            }
+            return $browserWindows[0]
+        }
+    }
+
+    if ($namedWindows.Count -eq 1) { return $namedWindows[0] }
+    if ($namedWindows.Count -gt 1) {
+        throw 'wechat_window_ambiguous'
+    }
+
+    # Cold-start Weixin can expose a transient confirmation dialog next to the
+    # real login window. The login window is the only legacy window that owns
+    # the "进入微信" action, so use it as the deterministic host.
+    $entryWindows = @($windows | Where-Object {
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($_.Handle)
+            if ($null -eq $root) { return $false }
+            $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Button)
+            @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition) | Where-Object {
+                $_.Current.Name -eq $script:WeChatEntryButtonName -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen
+            }).Count -gt 0
+        } catch { $false }
+    })
+    if ($entryWindows.Count -eq 1) { return $entryWindows[0] }
+    if ($entryWindows.Count -gt 1) {
+        throw 'wechat_window_ambiguous'
     }
 
     $legacyWindows = @($windows | Where-Object { $_.ProcessName -in @('Weixin', 'WeChat') })
@@ -168,24 +232,42 @@ function Select-WeChatMainWindow {
     throw 'wechat_window_ambiguous'
 }
 
-function Invoke-VisibleWeChatConfirmationButtons {
+function Get-VisibleWeChatConfirmationButtons {
     param([Parameter(Mandatory = $true)][IntPtr]$HostHandle)
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($HostHandle)
-    if ($null -eq $root) { return $false }
+    if ($null -eq $root) { return @() }
     $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button)
+    return @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition) | Where-Object {
+        $_.Current.Name -in @($script:WeChatAcknowledgedButtonName, $script:WeChatEntryButtonName) -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen
+    })
+}
+
+function Invoke-VisibleWeChatConfirmationButtons {
+    param([Parameter(Mandatory = $true)][IntPtr]$HostHandle)
+    [void][TrendRadar.WeChatChannelAutomation]::ActivateWindow($HostHandle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)
+    Start-Sleep -Milliseconds 100
     $clicked = $false
-    foreach ($button in @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition))) {
-        $name = [string]$button.Current.Name
-        if ($name -notin @('我知道了', '进入微信') -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen) { continue }
+    foreach ($name in @($script:WeChatAcknowledgedButtonName, $script:WeChatEntryButtonName)) {
+        $button = @(Get-VisibleWeChatConfirmationButtons -HostHandle $HostHandle | Where-Object {
+            $_.Current.Name -ceq $name
+        } | Select-Object -First 1)
+        if ($button.Count -eq 0) { continue }
+        $button = $button[0]
         $invoke = $null
         if ($button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
             $invoke.Invoke()
             $clicked = $true
             Start-Sleep -Milliseconds 350
-            continue
         }
+        # WeChat rebuilds this panel after the first confirmation. Re-query
+        # the named button so the fallback click uses a live bounding rectangle.
+        $button = @(Get-VisibleWeChatConfirmationButtons -HostHandle $HostHandle | Where-Object {
+            $_.Current.Name -ceq $name
+        } | Select-Object -First 1)
+        if ($button.Count -eq 0) { continue }
+        $button = $button[0]
         $rect = $button.Current.BoundingRectangle
         if ($rect.Width -le 0 -or $rect.Height -le 0) { continue }
         [void][TrendRadar.WeChatChannelAutomation]::SetCursorPos(
@@ -195,6 +277,34 @@ function Invoke-VisibleWeChatConfirmationButtons {
         [TrendRadar.WeChatChannelAutomation]::mouse_event([TrendRadar.WeChatChannelAutomation]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
         $clicked = $true
         Start-Sleep -Milliseconds 350
+    }
+    return $clicked
+}
+
+function Get-AllVisibleWeChatConfirmationButtons {
+    $buttons = [System.Collections.Generic.List[object]]::new()
+    foreach ($window in @(Get-WeChatWindows)) {
+        foreach ($button in @(Get-VisibleWeChatConfirmationButtons -HostHandle $window.Handle)) {
+            $buttons.Add([pscustomobject]@{
+                Window = $window
+                Button = $button
+            })
+        }
+    }
+    return @($buttons)
+}
+
+function Invoke-AllVisibleWeChatConfirmationButtons {
+    $clicked = $false
+    foreach ($window in @(Get-WeChatWindows)) {
+        try {
+            $windowClicked = Invoke-VisibleWeChatConfirmationButtons -HostHandle $window.Handle
+            if ($windowClicked) {
+                $clicked = $true
+            }
+        } catch {
+            continue
+        }
     }
     return $clicked
 }
@@ -393,21 +503,39 @@ if (-not $EntryOnly -and -not (Test-ShareUrl -Value $ShareUrl)) { throw 'wechat_
 # below as a compatibility fallback for old WeChat builds.
 [void](Invoke-WeChatLaunchFinder)
 $main = $null
-for ($attempt = 0; $attempt -lt 30 -and $null -eq $main; $attempt++) {
-    try { $main = Select-WeChatMainWindow } catch { Start-Sleep -Milliseconds 500 }
+# Cold-starting Weixin can take longer than the protocol handler return.
+for ($attempt = 0; $attempt -lt 120 -and $null -eq $main; $attempt++) {
+    try { $main = Select-WeChatMainWindow -EntryOnly:$EntryOnly } catch { Start-Sleep -Milliseconds 500 }
 }
 if ($null -eq $main) { throw 'wechat_window_not_found' }
 if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($main.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_window_activation_failed' }
 Start-Sleep -Milliseconds 150
 $manualStartedAt = [DateTime]::UtcNow
-$manualDeadlineAt = $manualStartedAt.AddSeconds(180)
-$foregroundAttempted = $true
-$clickedConfirmation = Invoke-VisibleWeChatConfirmationButtons -HostHandle $main.Handle
-if ($clickedConfirmation) {
+    $manualDeadlineAt = $manualStartedAt.AddSeconds(180)
+    $foregroundAttempted = $true
+$clickedConfirmation = Invoke-AllVisibleWeChatConfirmationButtons
+
+if ($EntryOnly -and $clickedConfirmation) {
+    # EntryOnly still needs the real finder navigation after confirmation. Do
+    # not treat the confirmation dialog disappearing as page navigation.
+    Write-ManualInterventionProgress -Phase 'waiting_for_human' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+    while ([DateTime]::UtcNow -lt $manualDeadlineAt) {
+        if (@(Get-AllVisibleWeChatConfirmationButtons).Count -eq 0) { break }
+        [void](Invoke-AllVisibleWeChatConfirmationButtons)
+        Start-Sleep -Milliseconds 500
+    }
+    if (@(Get-AllVisibleWeChatConfirmationButtons).Count -ne 0) {
+        Write-ManualInterventionProgress -Phase 'timed_out' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+        throw 'wechat_entry_confirmation_timeout'
+    }
+    Write-ManualInterventionProgress -Phase 'resumed' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
+}
+
+if ($clickedConfirmation -and -not $EntryOnly) {
     Write-ManualInterventionProgress -Phase 'waiting_for_human' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
     while ([DateTime]::UtcNow -lt $manualDeadlineAt) {
         if (@(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1) { break }
-        [void](Invoke-VisibleWeChatConfirmationButtons -HostHandle $main.Handle)
+        [void](Invoke-AllVisibleWeChatConfirmationButtons)
         Start-Sleep -Milliseconds 500
     }
     if (@(Get-AddressBarMatches -HostHandle $main.Handle).Count -ne 1) {
@@ -417,7 +545,11 @@ if ($clickedConfirmation) {
     Write-ManualInterventionProgress -Phase 'resumed' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
 }
 
-$browserHostReady = @(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1
+$browserHostReady = if ($EntryOnly) {
+    $false
+} else {
+    @(Get-AddressBarMatches -HostHandle $main.Handle).Count -eq 1
+}
 
 if (-not [TrendRadar.WeChatChannelAutomation]::ActivateWindow($main.Handle, [TrendRadar.WeChatChannelAutomation]::SW_RESTORE)) { throw 'wechat_window_activation_failed' }
 Start-Sleep -Milliseconds 150
@@ -436,7 +568,11 @@ if (-not $browserHostReady) {
             -TemplateNames @('wechat-discover-entry-active-template.b64', 'wechat-discover-entry-inactive-template.b64') `
             -ReferenceX 59 -ReferenceY 512 -Scales $entryScales -PixelRadius 2
         Write-Verbose ("discover-entry window={0} best={1},{2} template={3} scale={4} score={5} combined={6}" -f $main.HandleText, $discover.X, $discover.Y, $discover.TemplateName, $discover.TemplateScale, $discover.TemplateScore, $discover.CombinedScore)
-        if ($discover.TemplateScore -ge 0.84) {
+        # The current Weixin build renders the compass in a low-contrast gray
+        # state. Its fixed geometry remains stable, but the inactive template
+        # score is lower than the active green asset, so keep a conservative
+        # evidence floor while allowing the known coordinate to win.
+        if ($discover.TemplateScore -ge 0.20) {
             Invoke-WindowClick -Window $main -X $discover.X -Y $discover.Y
 
             $channel = $null
@@ -448,7 +584,7 @@ if (-not $browserHostReady) {
                         -TemplateNames @('wechat-channel-menu-active-template.b64', 'wechat-channel-menu-inactive-template.b64') `
                         -ReferenceX 172 -ReferenceY 303 -Scales $entryScales -PixelRadius 2
                 } finally { $menuBitmap.Dispose() }
-                if ($channel.TemplateScore -ge 0.84) { break }
+                if ($channel.TemplateScore -ge 0.20) { break }
                 $channel = $null
             }
             if ($null -eq $channel) { throw 'wechat_channel_menu_not_ready' }
@@ -479,11 +615,6 @@ if (-not $browserHostReady) {
         }
         Write-ManualInterventionProgress -Phase 'resumed' -Reason 'wechat_entry_confirmation_required' -StartedAt $manualStartedAt -DeadlineAt $manualDeadlineAt -ForegroundAttempted $foregroundAttempted
     }
-}
-
-if ($EntryOnly -and -not $Refresh) {
-    'wechat_channel_entry_sent'
-    return
 }
 
 $webView = $null
@@ -547,9 +678,13 @@ if ($webViewTopLevel) {
 }
 
 if ($EntryOnly) {
+    # The existing WeChat WebView may have been created before the temporary
+    # proxy was installed. Refresh the selected Channels page once so ltaoo can
+    # inject its bridge into the current document; this does not touch the URL.
     if (-not [TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYDOWN, [IntPtr]0x74, [IntPtr]::Zero)) { throw 'wechat_page_refresh_failed' }
     [void][TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYUP, [IntPtr]0x74, [IntPtr]::Zero)
-    'wechat_page_refresh_sent'
+    Start-Sleep -Milliseconds 500
+    'wechat_channel_entry_sent'
     return
 }
 
