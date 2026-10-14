@@ -10,13 +10,16 @@
 - 页面桥已经可用，评论接口也能返回数据，因此这次问题不在页面桥未就绪、评论分页或授权数据库。
 - 最新批处理的搜索诊断显示：第一次 `finderSearch` 返回 1 个 `infoList` 项；后续多次搜索响应只有很小的空结果结构，但游标仍在变化。最终 3 个作品来自账号视频列表 `finderUserPage`，不是搜索结果完整返回的 10 个作品。
 - 当前证据没有证明是本地去重把结果从 10 个压成 3 个，也没有证明代理把响应截断；问题边界已经收敛到 `finderSearch` 的场景、请求体、游标传递或响应解析链路。
+- 2026-10-14 复核运行文件后确认：部署目录的 `wx_video_download.exe` 是 Go 1.20.14、2026-08-17 的旧 Ltaoo 二进制（SHA256 `18F0E4CA43CC16F8235C8CFD35031B6A822853C87B2493FBC2BCF87DDAD9F40`）。它具备 `server/-c/2023` 外形契约，也包含旧的 `lastBuff`，但不包含 `searchType === 3 ? 19 : 13`，因此启动检查原先会误放行旧程序。
+- `.poc-build/wx_video_download_type3.exe` 是 Go 1.24.3、`with_gvisor,embed_inject,sqlite_only,embed_frontend_inject` 构建，SHA256 `4F30AB98CEE27955EF0F4C1A377BEE5E7D10E87A5B6810529C8A3FD2CAD566B1`；其内嵌桥包含 `key:channels:contact_list`、`searchType === 3 ? 19 : 13` 和 `lastBuff: data.next_marker`。后续启动检查必须验证这些内嵌标记，不能只验证 CLI 帮助。
 
 ### 已知的重复错误
 
 1. 曾经把同名 POC 可执行文件当成 Ltaoo 运行程序交付。以后启动前必须执行 `--help` 契约检查并记录可执行文件 SHA256，确认包含 `server`、`-c/--config` 和默认端口 2023。
-2. 不能直接修改授权 SQLite 来“修复”授权。运行程序更换后必须通过控制台重新检测和授权。
-3. 不能在没有原始批处理诊断的情况下反复猜端口、CA、页面刷新或代理。先读取 `request.json`、`batch/manifest.json`、`page_diagnostics` 和结果清单。
-4. 搜索目标数量不能用“返回了几个”反推配置。必须同时核对请求的 `limits.works`、搜索调用次数、每页结果形状、游标变化和最终作品来源。
+2. 仅检查 CLI 帮助仍然会放过旧 Ltaoo。启动前还必须检查内嵌页面桥的视频搜索标记：`searchType === 3 ? 19 : 13`、`lastBuff: data.next_marker` 和 `key:channels:contact_list`。
+3. 不能直接修改授权 SQLite 来“修复”授权。运行程序更换后必须通过控制台重新检测和授权。
+4. 不能在没有原始批处理诊断的情况下反复猜端口、CA、页面刷新或代理。先读取 `request.json`、`batch/manifest.json`、`page_diagnostics` 和结果清单。
+5. 搜索目标数量不能用“返回了几个”反推配置。必须同时核对请求的 `limits.works`、搜索调用次数、每页结果形状、游标变化和最终作品来源。
 
 ### 下次排查顺序
 

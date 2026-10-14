@@ -353,6 +353,9 @@ func TestTrendRadarRuntimeValidatesLtaooContractBeforeStarting(t *testing.T) {
 		"--hostname\\s+string",
 		"--port\\s+int",
 		"default\\s+(\"?2023\"?)",
+		"key:channels:contact_list",
+		"searchtype === 3 ? 19 : 13",
+		"lastbuff: data.next_marker",
 	} {
 		if !strings.Contains(entry, required) {
 			t.Fatalf("Ltaoo contract must require %q", required)

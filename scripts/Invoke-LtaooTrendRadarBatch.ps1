@@ -65,6 +65,21 @@ function Test-LtaooExecutableContract {
         )) {
             if ($help -notmatch $pattern) { throw 'ltaoo_executable_contract_invalid' }
         }
+
+        # The CLI shape alone is not enough: an older Ltaoo binary exposes the
+        # same server command but maps every contact search to scene 13. That
+        # silently turns a video search into an account search and is exactly
+        # how a ten-work request collapsed to three account-feed works. Verify
+        # the embedded page bridge carries the video scene and cursor contract
+        # before allowing the process to start.
+        $embedded = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($ExecutablePath))
+        foreach ($marker in @(
+            'key:channels:contact_list',
+            'searchType === 3 ? 19 : 13',
+            'lastBuff: data.next_marker'
+        )) {
+            if (-not $embedded.Contains($marker)) { throw 'ltaoo_search_scene_contract_invalid' }
+        }
     } catch [System.Management.Automation.RuntimeException] {
         throw
     } catch {
