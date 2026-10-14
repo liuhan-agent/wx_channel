@@ -113,6 +113,14 @@ function assert(condition, message) {
 }
 
 async function main() {
+  const configuredPortEnv = loadAPIClientModule({
+    window: {
+      __WX_CHANNEL_API_CONFIG__: { apiPort: 2022 },
+    },
+  });
+  assertEqual(configuredPortEnv.api.getWebSocketPorts()[0], 2022, 'runtime api port should be tried first');
+  assert(configuredPortEnv.api.getWebSocketPorts().includes(2026), 'legacy api port should remain a fallback');
+
   const shareEnv = loadAPIClientModule();
   const sharePayload = await shareEnv.api.buildFeedProfilePayload({
     url: 'https://weixin.qq.com/sph/A1b2C3d4',

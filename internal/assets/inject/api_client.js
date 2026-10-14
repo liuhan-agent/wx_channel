@@ -436,6 +436,40 @@ window.__wx_api_client = {
   },
 
   // 连接 WebSocket
+  getWebSocketPorts: function () {
+    var ports = [];
+    var addPort = function (value) {
+      var port = parseInt(value, 10);
+      if (!isFinite(port) || port < 1 || port > 65535 || ports.indexOf(port) >= 0) {
+        return;
+      }
+      ports.push(port);
+    };
+
+    // 页面由代理按本轮运行配置注入 apiPort；旧端口只作为兼容回退。
+    try {
+      var runtimeConfig = window.__WX_CHANNEL_API_CONFIG__;
+      if (runtimeConfig) {
+        addPort(runtimeConfig.apiPort || runtimeConfig.port || runtimeConfig.wsPort);
+      }
+    } catch (e) {
+      // ignore malformed runtime config and keep legacy fallbacks
+    }
+    addPort(window.__WX_API_PORT__);
+
+    try {
+      var lastPort = localStorage.getItem('__wx_api_ws_port');
+      if (lastPort) {
+        addPort(lastPort);
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    [2026, 9527, 8081, 3001].forEach(addPort);
+    return ports;
+  },
+
   connect: function () {
     if (this.connected) {
       return;
@@ -448,25 +482,11 @@ window.__wx_api_client = {
     this.connectToken += 1;
     var token = this.connectToken;
 
-    // 检测代理端口
-    // 方法1: 尝试从 /__wx_channels_api 端点获取端口信息
-    // 方法2: 使用默认端口 2026
-    var wsPort = 2026; // 默认端口
-
-    // 尝试多个可能的端口
-    var possiblePorts = [2026, 9527, 8081, 3001];
-
-    // 从 localStorage 获取上次成功的端口
-    try {
-      var lastPort = localStorage.getItem('__wx_api_ws_port');
-      if (lastPort) {
-        possiblePorts.unshift(parseInt(lastPort));
-      }
-    } catch (e) {
-      // ignore
+    var possiblePorts = this.getWebSocketPorts();
+    if (possiblePorts.length === 0) {
+      possiblePorts = [2026];
     }
 
-    // 尝试连接
     this.tryConnect(possiblePorts, 0, token);
   },
 

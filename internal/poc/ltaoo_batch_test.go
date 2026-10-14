@@ -248,7 +248,7 @@ func TestRunAndFinalizeLtaooBatchPublishesVerifiedMediaAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.SchemaVersion != "wechat-channels-batch/2" || manifest.Status != BatchSucceeded {
+	if manifest.SchemaVersion != "wechat-channels-batch/3" || manifest.Status != BatchSucceeded {
 		t.Fatalf("manifest=%+v", manifest)
 	}
 	assetRaw, err := os.ReadFile(filepath.Join(runRoot, "batch", "media-assets.jsonl"))
@@ -400,6 +400,57 @@ func TestRunLtaooBatchKeywordDiscoveryGeneratesPublicURL(t *testing.T) {
 	}
 	if !strings.Contains(string(contents), "https://weixin.qq.com/sph/generated-batch-1") {
 		t.Fatalf("contents=%s", contents)
+	}
+}
+
+func TestRunLtaooBatchKeywordDiscoveryContinuesWithoutPublicURL(t *testing.T) {
+	server := newBatchFixtureServerWithShareURL(t, "", "https://example.com/not-a-wechat-share")
+	defer server.Close()
+	runRoot := t.TempDir()
+	requestPath := filepath.Join(runRoot, "request.json")
+	writeBatchRequestFixture(t, requestPath, runRoot, func(value map[string]any, _ string) {
+		value["content_urls"] = []string{}
+		value["limits"].(map[string]any)["works"] = 1
+	})
+	request, err := LoadBatchRequest(requestPath, runRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft, err := RunLtaooBatch(context.Background(), request, client, runRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft.Status != BatchPartial || draft.Counts.Works != 1 || draft.Counts.TopLevelComments != 1 {
+		t.Fatalf("draft=%+v", draft)
+	}
+	if len(draft.ReasonCodes) != 1 || draft.ReasonCodes[0] != "share_url_unavailable" {
+		t.Fatalf("reason codes=%v", draft.ReasonCodes)
+	}
+	contents, err := os.ReadFile(filepath.Join(runRoot, "batch.partial-"+request.RunID, "contents.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(contents))), &content); err != nil {
+		t.Fatal(err)
+	}
+	locator, ok := content["locator"].(map[string]any)
+	if !ok {
+		t.Fatalf("content locator=%v", content["locator"])
+	}
+	if value, exists := locator["public_url"]; !exists || value != nil {
+		t.Fatalf("public_url=%v, want null", value)
+	}
+	issues, err := os.ReadFile(filepath.Join(runRoot, "batch.partial-"+request.RunID, "issues.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(issues), `"code":"share_url_unavailable"`) {
+		t.Fatalf("issues=%s", issues)
 	}
 }
 
@@ -628,10 +679,23 @@ func newBatchFixtureServer(t *testing.T, forbidden string) *httptest.Server {
 		`{"commentId":"batch-root-1","content":"public root","expandCommentCount":2,"privateHeader":%q}`,
 		forbidden,
 	)
-	return newBatchFixtureServerWithComment(t, forbidden, rootComment)
+	return newBatchFixtureServerWithShareURLAndComment(t, forbidden, rootComment, "https://weixin.qq.com/sph/generated-batch-1")
 }
 
 func newBatchFixtureServerWithComment(t *testing.T, forbidden, rootComment string) *httptest.Server {
+	return newBatchFixtureServerWithShareURLAndComment(t, forbidden, rootComment, "https://weixin.qq.com/sph/generated-batch-1")
+}
+
+func newBatchFixtureServerWithShareURL(t *testing.T, forbidden, shareURL string) *httptest.Server {
+	t.Helper()
+	rootComment := fmt.Sprintf(
+		`{"commentId":"batch-root-1","content":"public root","expandCommentCount":2,"privateHeader":%q}`,
+		forbidden,
+	)
+	return newBatchFixtureServerWithShareURLAndComment(t, forbidden, rootComment, shareURL)
+}
+
+func newBatchFixtureServerWithShareURLAndComment(t *testing.T, forbidden, rootComment, shareURL string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -643,9 +707,9 @@ func newBatchFixtureServerWithComment(t *testing.T, forbidden, rootComment strin
 		case "/api/channels/contact/search":
 			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"infoList":[{"contact":{"username":"batch-finder"}}],"lastBuff":""}}}`)
 		case "/api/channels/contact/feed/list":
-			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"batch-work-1","objectNonceId":"batch-nonce-1","objectDesc":{"description":"batch title","mediaType":2}}],"lastBuffer":""}}}`)
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"batch-work-1","objectNonceId":"batch-nonce-1","objectDesc":{"description":"batch title","mediaType":4}}],"lastBuffer":""}}}`)
 		case "/api/channels/feed/share_url":
-			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":"https://weixin.qq.com/sph/generated-batch-1"}}}`)
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":%q}}}`, shareURL)
 		case "/api/channels/feed/comment/list":
 			if r.URL.Query().Get("comment_id") == "" {
 				_, _ = fmt.Fprintf(w, `{"code":0,"data":{"errCode":0,"data":{"commentInfo":[%s],"lastBuffer":""}}}`, rootComment)

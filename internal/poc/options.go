@@ -9,6 +9,7 @@ import (
 type Options struct {
 	Keyword           string
 	Limits            Limits
+	RequireVideoWorks bool
 	HumanWait         HumanWaitPolicy
 	RequestInterval   time.Duration
 	ProxyAddress      string

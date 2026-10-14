@@ -33,33 +33,212 @@ function Resolve-RuntimeFile {
     return $resolved
 }
 
+function Test-LtaooExecutableContract {
+    param([Parameter(Mandatory = $true)][string]$ExecutablePath)
+
+    # The provider slot is intentionally narrow. A POC wx_channel binary can
+    # also expose a config flag, but it is a different server with different
+    # ports and routes. Check the Ltaoo command shape before starting it so a
+    # mistaken delivery copy fails closed instead of silently binding 2025/2026.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ExecutablePath
+    $startInfo.Arguments = '--help'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw 'ltaoo_help_start_failed' }
+        if (-not $process.WaitForExit(10000)) {
+            try { $process.Kill() } catch {}
+            throw 'ltaoo_help_timeout'
+        }
+        $help = (($process.StandardOutput.ReadToEnd()) + "`n" + ($process.StandardError.ReadToEnd()))
+        foreach ($pattern in @(
+            '(?im)^\s*wx_video_download\s+\[flags\]',
+            '(?im)^\s+server\s+',
+            '(?im)(^|\s)-c,\s*--config\b',
+            '(?im)^\s+--hostname\s+string\b',
+            '(?im)^\s+--port\s+int\b.*\(default\s+("?2023"?)\)'
+        )) {
+            if ($help -notmatch $pattern) { throw 'ltaoo_executable_contract_invalid' }
+        }
+    } catch [System.Management.Automation.RuntimeException] {
+        throw
+    } catch {
+        throw 'ltaoo_help_probe_failed'
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Get-ListenerAbsent {
     param([Parameter(Mandatory = $true)][int[]]$Ports)
     return @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -in $Ports }).Count -eq 0
 }
 
-function Test-LtaooChannelsBridgeAvailable {
-    param([Parameter(Mandatory = $true)][string]$ApiBase)
+function Test-LtaooProxyListenerPresent {
+    param([Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port)
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri ($ApiBase + '/api/channels/status') -TimeoutSec 2
-        if ([int]$response.StatusCode -ne 200) { return $false }
-        $body = $response.Content | ConvertFrom-Json
-        return $null -ne $body -and [int]$body.code -eq 0 -and $null -ne $body.data -and [bool]$body.data.available
+        return @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop).Count -gt 0
     } catch {
         return $false
+    }
+}
+
+function Test-LtaooRuntimeStatusReadyFromBody {
+    param(
+        [Parameter(Mandatory = $true)][object]$Body,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$ProxyPort
+    )
+    if ($null -eq $Body -or $null -eq $Body.PSObject.Properties['code'] -or
+        [int]$Body.code -ne 0 -or $null -eq $Body.PSObject.Properties['data'] -or $null -eq $Body.data) {
+        return $false
+    }
+    $data = $Body.data
+    $api = $null
+    $proxy = $null
+    if ($null -ne $data.PSObject.Properties['api']) { $api = $data.api }
+    if ($null -ne $data.PSObject.Properties['proxy']) { $proxy = $data.proxy }
+    $apiListening = $null
+    $proxyListening = $null
+    if ($null -ne $api -and $null -ne $api.PSObject.Properties['listening']) { $apiListening = $api.listening }
+    if ($null -ne $proxy -and $null -ne $proxy.PSObject.Properties['listening']) { $proxyListening = $proxy.listening }
+    if ($null -ne $apiListening -or $null -ne $proxyListening) {
+        return $apiListening -is [bool] -and $proxyListening -is [bool] -and $apiListening -and $proxyListening
+    }
+    return Test-LtaooProxyListenerPresent -Port $ProxyPort
+}
+
+function Wait-LtaooRuntimeReady {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiBase,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$LtaooProcess,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$ProxyPort
+    )
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        if ($LtaooProcess.HasExited) { return $false }
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri ($ApiBase + '/api/status') -TimeoutSec 2
+            if ([int]$response.StatusCode -eq 200) {
+                try {
+                    $body = $response.Content | ConvertFrom-Json
+                    if (Test-LtaooRuntimeStatusReadyFromBody -Body $body -ProxyPort $ProxyPort) { return $true }
+                } catch { }
+            }
+        } catch { }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Test-LtaooChannelsBridgeAvailableFromBody {
+    param([Parameter(Mandatory = $true)][object]$Body)
+    if ($null -eq $Body -or $null -eq $Body.PSObject.Properties['code'] -or
+        [int]$Body.code -ne 0 -or $null -eq $Body.PSObject.Properties['data'] -or $null -eq $Body.data) {
+        return $false
+    }
+    $data = $Body.data
+    if ($null -ne $data.PSObject.Properties['search_ready_clients']) {
+        return ($data.search_ready_clients -is [int] -or $data.search_ready_clients -is [long]) -and $data.search_ready_clients -gt 0
+    }
+    return $null -ne $data.PSObject.Properties['available'] -and $data.available -is [bool] -and $data.available
+}
+
+function Test-LtaooChannelsBridgeAvailable {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiBase,
+        [ref]$Diagnostic
+    )
+    $sample = [ordered]@{
+        outcome = 'request_error'; http_status = $null; code_ok = $false; data_present = $false
+        search_ready_clients_present = $false; search_ready_clients_type = 'missing'; search_ready_clients = $null
+        available_present = $false; available_type = 'missing'; available = $null
+    }
+    try {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri ($ApiBase + '/api/channels/status') -TimeoutSec 2
+        } catch {
+            $errorResponse = $null
+            if ($null -ne $_.Exception.PSObject.Properties['Response']) {
+                $errorResponse = $_.Exception.Response
+            }
+            if ($null -ne $errorResponse) {
+                try { $sample.http_status = [int]$errorResponse.StatusCode } catch {}
+            }
+            if ($null -ne $sample.http_status) { $sample.outcome = 'http_error' }
+            return $false
+        }
+        $sample.http_status = [int]$response.StatusCode
+        if ($sample.http_status -ne 200) { $sample.outcome = 'http_error'; return $false }
+        try { $body = $response.Content | ConvertFrom-Json }
+        catch { $sample.outcome = 'invalid_json'; return $false }
+        if ($null -ne $body -and $null -ne $body.PSObject.Properties['code']) {
+            try { $sample.code_ok = [int]$body.code -eq 0 } catch {}
+        }
+        if ($null -ne $body -and $null -ne $body.PSObject.Properties['data'] -and $null -ne $body.data) {
+            $sample.data_present = $true
+            $data = $body.data
+            if ($null -ne $data.PSObject.Properties['search_ready_clients']) {
+                $sample.search_ready_clients_present = $true
+                if ($null -eq $data.search_ready_clients) { $sample.search_ready_clients_type = 'null' }
+                elseif ($data.search_ready_clients -is [int] -or $data.search_ready_clients -is [long]) {
+                    $sample.search_ready_clients_type = 'integer'
+                    $sample.search_ready_clients = $data.search_ready_clients
+                } else { $sample.search_ready_clients_type = 'other' }
+            }
+            if ($null -ne $data.PSObject.Properties['available']) {
+                $sample.available_present = $true
+                if ($null -eq $data.available) { $sample.available_type = 'null' }
+                elseif ($data.available -is [bool]) {
+                    $sample.available_type = 'boolean'
+                    $sample.available = $data.available
+                } else { $sample.available_type = 'other' }
+            }
+        }
+        try { $ready = Test-LtaooChannelsBridgeAvailableFromBody -Body $body }
+        catch { $sample.outcome = 'invalid_status'; return $false }
+        if ($ready) { $sample.outcome = 'ready'; return $true }
+        $sample.outcome = 'status_not_ready'
+        return $false
+    } catch {
+        $sample.outcome = 'invalid_status'
+        return $false
+    } finally {
+        if ($null -ne $Diagnostic) { $Diagnostic.Value = [pscustomobject]$sample }
     }
 }
 
 function Wait-LtaooChannelsBridge {
     param(
         [Parameter(Mandatory = $true)][string]$ApiBase,
-        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$LtaooProcess
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$LtaooProcess,
+        [Parameter(Mandatory = $true)][string]$DiagnosticPath
     )
+    $counts = [ordered]@{
+        request_error = 0; http_error = 0; invalid_json = 0
+        invalid_status = 0; status_not_ready = 0; ready = 0
+    }
+    $attempts = 0
+    $last = $null
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
-        if ($LtaooProcess.HasExited) { return $false }
-        if (Test-LtaooChannelsBridgeAvailable -ApiBase $ApiBase) { return $true }
+        if ($LtaooProcess.HasExited) { break }
+        $sample = $null
+        $ready = Test-LtaooChannelsBridgeAvailable -ApiBase $ApiBase -Diagnostic ([ref]$sample)
+        $attempts++
+        $last = $sample
+        $counts[$sample.outcome]++
+        if ($ready) { return $true }
         Start-Sleep -Seconds 1
     }
+    try {
+        Write-LtaooJsonAtomic -Value ([ordered]@{
+            schema_version = 1; attempts = $attempts; counts = $counts
+            process_exited = $LtaooProcess.HasExited; last = $last
+        }) -LiteralPath $DiagnosticPath
+    } catch {}
     return $false
 }
 
@@ -286,6 +465,7 @@ $journal = $null
 $journalPath = $null
 $runtimeBase = $null
 $resolvedRunRoot = $null
+$preserveRecoveryArtifacts = $false
 $resolvedRequest = $null
 $resolvedGrant = $null
 $resolvedLtaoo = $null
@@ -322,6 +502,9 @@ try {
     $routerBackend = New-LtaooRouterBackend -RouterKind $effectiveRouterKind -ExecutablePath $resolvedRouter -ConfigPath $resolvedRouterConfig
     if ([IO.File]::Exists($journalPath)) {
         $currentStage = 'journal_recovery'
+        # A failed recovery must leave the prior run's evidence and router
+        # backup intact for an operator to inspect or retry safely.
+        $preserveRecoveryArtifacts = $true
         $prior = Read-RuntimeJournal -LiteralPath $journalPath
         $priorRunRoot = [IO.Path]::GetFullPath([string]$prior.run_root)
         Assert-LtaooNoReparsePoint -BasePath $runtimeBase -TargetPath $priorRunRoot
@@ -331,6 +514,7 @@ try {
         [void](Invoke-JournalFinalize -Journal $prior -ReceiptPath $priorReceiptPath)
         if (-not [bool]$priorReceipt.safe -or -not (Test-JournalPublicationClosed -Journal $prior)) { exit 3 }
         Remove-Item -LiteralPath $journalPath -Force
+        $preserveRecoveryArtifacts = $false
     }
 
     $currentStage = 'resolve_runtime_files'
@@ -343,6 +527,7 @@ try {
     if ([IO.Path]::GetFileName($resolvedLtaoo) -ine 'wx_video_download.exe' -or [IO.Path]::GetFileName($resolvedBatch) -ine 'wx_channel_ltaoo_batch.exe') {
         throw 'runtime_executable_invalid'
     }
+    Test-LtaooExecutableContract -ExecutablePath $resolvedLtaoo
 
     $requestAllowedProperties = @('schema_version', 'run_id', 'keyword', 'content_urls', 'limits', 'output_root')
     $request = Read-LtaooStrictJson -LiteralPath $resolvedRequest -AllowedProperties $requestAllowedProperties
@@ -437,16 +622,7 @@ cert:
     Write-LtaooJsonAtomic -Value $journal -LiteralPath $journalPath
 
     $apiBase = 'http://127.0.0.1:' + $ApiPort
-    $ready = $false
-    for ($attempt = 0; $attempt -lt 60; $attempt++) {
-        if ($ltaooProcess.HasExited) { break }
-        try {
-            $status = Invoke-WebRequest -UseBasicParsing -Uri ($apiBase + '/api/status') -TimeoutSec 2
-            if ([int]$status.StatusCode -eq 200) { $ready = $true; break }
-        } catch { }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $ready) { throw 'ltaoo_readiness_failed' }
+    if (-not (Wait-LtaooRuntimeReady -ApiBase $apiBase -LtaooProcess $ltaooProcess -ProxyPort $ProxyPort)) { throw 'ltaoo_readiness_failed' }
     $currentStage = 'ltaoo_ready'
 
     if ($AutoOpenFirstShareUrl) {
@@ -479,13 +655,9 @@ cert:
         Start-Sleep -Milliseconds 500
     }
 
-    if ($AutoOpenFirstShareUrl -or $AutoRefreshWechatPage) {
-        $currentStage = 'page_bridge'
-        if (-not (Wait-LtaooChannelsBridge -ApiBase $apiBase -LtaooProcess $ltaooProcess)) { throw 'bridge_unavailable' }
-        $journal.phase = 'page_bridge_ready'
-        Write-LtaooJsonAtomic -Value $journal -LiteralPath $journalPath
-    }
-
+    # The legacy /api/channels/status response exposes channels.available=false
+    # even when the page bridge is usable. The Go batch owns the actual profile
+    # and search readiness probe, so do not gate collection on that status field.
     $journal.phase = 'collecting'
     $currentStage = 'collecting'
     Write-LtaooJsonAtomic -Value $journal -LiteralPath $journalPath
@@ -521,7 +693,7 @@ cert:
                 $finalExitCode = 3
             }
         } catch { $finalExitCode = 3 }
-    } elseif ($null -ne $resolvedRunRoot) {
+    } elseif ($null -ne $resolvedRunRoot -and -not $preserveRecoveryArtifacts) {
         foreach ($name in @('router-baseline.bin', 'router-candidate.yaml', 'router-recovery-candidate.yaml', 'clash-baseline.bin', 'clash-candidate.yaml', 'clash-recovery-candidate.yaml', 'ltaoo-runtime.yaml')) {
             $target = Join-Path $resolvedRunRoot $name
             if ([IO.File]::Exists($target)) { Remove-Item -LiteralPath $target -Force }

@@ -23,8 +23,15 @@
 
   async function invoke(method, body) {
     if (!allowed.has(method)) throw new Error('method_not_allowed');
-    if (method === 'finderSearch') return WXU.API2.finderSearch({query: body.keyword, scene: 19, requestId: String(Date.now()), lastBuffer: body.next_marker || '', lastBuff: body.next_marker || ''});
-    if (method === 'finderUserPage') return WXU.API.finderUserPage({username: body.username, finderUsername: window.__wx_username || body.username, lastBuffer: body.next_marker || '', needFansCount: 0, objectId: '0'});
+    if (method === 'finderSearch') {
+      // Keep the scene mapping aligned with the reference client:
+      // account search (type 1) uses scene 13, video search (type 3) uses
+      // scene 19. The batch collector intentionally runs both when it needs
+      // to expand account results into the account's video feed.
+      const scene = Number(body.type) === 3 ? 19 : 13;
+      return WXU.API2.finderSearch({query: body.keyword, scene: scene, requestId: String(Date.now()), lastBuffer: body.next_marker || '', lastBuff: body.next_marker || ''});
+    }
+    if (method === 'finderUserPage') return WXU.API.finderUserPage({username: body.username, finderUsername: window.__wx_username || '', lastBuffer: body.next_marker || '', needFansCount: 0, objectId: '0'});
     if (method === 'finderGetCommentDetail') return WXU.API.finderGetCommentDetail({needObject: 1, lastBuffer: '', scene: 146, direction: 2, identityScene: 2, pullScene: 6, objectid: String(body.object_id).split('_')[0], objectNonceId: body.nonce_id, encrypted_objectid: ''});
     const payload = body.comment_id ? {direction: 2, identityScene: 2, objectId: body.object_id, rootCommentId: body.comment_id, lastBuffer: body.next_marker || undefined} : {finderBasereq: {scene: 140, ctxInfo: {clientReportBuff: '{"entranceId":"1002"}'}, objectBaseInfos: []}, objectId: body.object_id, objectNonceId: body.nonce_id, direction: 2, identityScene: 2, lastBuffer: body.next_marker || undefined, enterSessionId: String(Date.now())};
     return WXU.API.finderGetCommentList(payload);

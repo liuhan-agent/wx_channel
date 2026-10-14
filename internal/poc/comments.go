@@ -115,7 +115,7 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 			}
 			return comments, summary, err
 		}
-		items, nextMarker, markerPresent, _, err := parseCommentPage(raw)
+		items, nextMarker, markerPresent, reportedCommentCount, reportedCountPresent, err := parseCommentPage(raw)
 		if err != nil {
 			if checkpointErr := c.saveCommentCheckpoint(work, comments, marker, "comments_top", roots, nil); checkpointErr != nil {
 				return comments, summary, checkpointErr
@@ -194,7 +194,41 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 			}
 			break
 		}
+		if len(items) == 0 {
+			if markerPresent {
+				if nextMarker == "" {
+					break
+				}
+				if reportedCountPresent && reportedCommentCount == 0 &&
+					summary.TopLevel+summary.Replies == 0 {
+					break
+				}
+				// commentCount is reported by WeChat as the total number of
+				// comments, including replies embedded in the top-level page.
+				// An empty follow-up page can therefore be complete once the
+				// retained top-level comments and replies reach that count.
+				if reportedCountPresent && reportedCommentCount > 0 &&
+					summary.TopLevel+summary.Replies >= reportedCommentCount {
+					break
+				}
+				markPartial(&summary, "comment_pagination_incomplete")
+				break
+			}
+			if reportedCountPresent && reportedCommentCount == 0 && len(comments) == 0 {
+				break
+			}
+			markPartial(&summary, "comment_pagination_incomplete")
+			break
+		}
 		if !markerPresent {
+			// Some WeChat responses omit lastBuffer even after returning the
+			// complete top-level set. A reported count that has been reached is
+			// an explicit completeness signal for that page; keep the stricter
+			// partial result when the count is unknown or still ahead.
+			if reportedCountPresent && reportedCommentCount > 0 &&
+				summary.TopLevel+summary.Replies >= reportedCommentCount {
+				break
+			}
 			markPartial(&summary, "comment_pagination_incomplete")
 			break
 		}
@@ -244,7 +278,7 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 				}
 				return comments, summary, err
 			}
-			items, nextMarker, markerPresent, _, err := parseCommentPage(raw)
+			items, nextMarker, markerPresent, _, _, err := parseCommentPage(raw)
 			if err != nil {
 				if checkpointErr := c.saveCommentCheckpoint(work, comments, marker, "comments_replies", roots[rootIndex:], &root.id); checkpointErr != nil {
 					return comments, summary, checkpointErr
@@ -303,24 +337,24 @@ func (c *Collector) CollectComments(ctx context.Context, options Options, work W
 	return comments, summary, nil
 }
 
-func parseCommentPage(raw []byte) (items []map[string]any, lastBuffer string, lastBufferPresent bool, reported int, err error) {
+func parseCommentPage(raw []byte) (items []map[string]any, lastBuffer string, lastBufferPresent bool, reported int, reportedPresent bool, err error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var root map[string]any
 	if decodeErr := decoder.Decode(&root); decodeErr != nil {
-		return nil, "", false, 0, errors.New("decode comment response")
+		return nil, "", false, 0, false, errors.New("decode comment response")
 	}
 	var trailing any
 	if decodeErr := decoder.Decode(&trailing); !errors.Is(decodeErr, io.EOF) {
-		return nil, "", false, 0, errors.New("comment response contains trailing JSON")
+		return nil, "", false, 0, false, errors.New("comment response contains trailing JSON")
 	}
 	data, ok := root["data"].(map[string]any)
 	if !ok {
-		return nil, "", false, 0, errors.New("comment response data is missing")
+		return nil, "", false, 0, false, errors.New("comment response data is missing")
 	}
 	rawItems, ok := data["commentInfo"].([]any)
 	if !ok {
-		return nil, "", false, 0, errors.New("comment info is missing")
+		return nil, "", false, 0, false, errors.New("comment info is missing")
 	}
 	items = make([]map[string]any, 0, len(rawItems))
 	for _, rawItem := range rawItems {
@@ -332,20 +366,31 @@ func parseCommentPage(raw []byte) (items []map[string]any, lastBuffer string, la
 	}
 	markerValue, present := data["lastBuffer"]
 	if !present {
-		return items, "", false, reportedCount(data), nil
+		reportedCountValue, reportedCountKnown := reportedCount(data)
+		return items, "", false, reportedCountValue, reportedCountKnown, nil
 	}
 	marker, ok := markerValue.(string)
 	if !ok {
-		return nil, "", false, 0, errors.New("comment marker is not a string")
+		return nil, "", false, 0, false, errors.New("comment marker is not a string")
 	}
-	return items, marker, true, reportedCount(data), nil
+	reportedCountValue, reportedCountKnown := reportedCount(data)
+	return items, marker, true, reportedCountValue, reportedCountKnown, nil
 }
 
-func reportedCount(data map[string]any) int {
-	if countInfo, ok := data["countInfo"].(map[string]any); ok {
-		return integerField(countInfo, "commentCount")
+func reportedCount(data map[string]any) (int, bool) {
+	countInfo, ok := data["countInfo"].(map[string]any)
+	if !ok {
+		return 0, false
 	}
-	return 0
+	raw, present := stringField(countInfo, "commentCount")
+	if !present {
+		return 0, false
+	}
+	count, err := strconv.Atoi(raw)
+	if err != nil || count < 0 {
+		return 0, false
+	}
+	return count, true
 }
 
 type commentMediaCandidate struct {

@@ -27,6 +27,11 @@ certificate store or proxy router. There is no
   `Cert:\CurrentUser\Root` and to replace the selected Mihomo YAML.
 - API/proxy ports (2022/2023 by default) free before the run.
 
+After ltaoo starts, the runtime waits for both the API health response on
+2022 and a listening proxy socket on 2023 owned by that ltaoo process before it
+touches the WeChat page. This prevents a page refresh from entering a proxy
+port that is still starting.
+
 The proxy client remains running. `MihomoBackend` inserts one marked loopback HTTP proxy and
 ordered process rules, validates the candidate with the configured Mihomo core,
 atomically replaces the YAML, and reloads the core through its loopback API.
@@ -40,8 +45,8 @@ Channels page has been injected. The page bridge is established only after a
 Channels page is loaded through the running proxy and its injected client
 registers the required API methods. For a manual run:
 
-1. Start the collection run and wait until the runtime has opened its API
-   listener (2022 by default).
+1. Start the collection run and wait until the runtime has opened both its API
+   listener (2022 by default) and its ltaoo-owned proxy listener (2023).
 2. Refresh the already-open Channels video once, or leave and re-enter it.
 3. Keep that page open while the batch performs the shared, bounded profile
    readiness probe. The first configured link proves the bridge; the remaining
@@ -74,7 +79,11 @@ before either click. For keyword-discovery requests with no `content_urls`,
 the helper stops after sending the verified entry clicks; the runtime then
 requires the Channels page bridge to become available before the batch performs
 the existing `finderSearch` flow with the request `keyword`. A share link is
-not required. When `content_urls` is
+not required: batch schema v3 uses `work_id` and `object_nonce_id` as the
+collection identity, and `locator.public_url` is optional metadata. If the
+share URL endpoint cannot resolve one result, the work remains eligible for
+comment collection and the batch records `share_url_unavailable` as a partial
+diagnostic. When `content_urls` is
 non-empty, the helper additionally writes the first configured URL through an
 available `OmniboxViewViews` value pattern and submits Enter. The remaining
 configured links are handled by the same batch/profile bridge and are not

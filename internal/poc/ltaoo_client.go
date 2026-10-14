@@ -117,6 +117,9 @@ func (c *LtaooClient) Call(ctx context.Context, method string, body any) ([]byte
 	}
 	if method == "finderSearch" || method == "finderUserPage" {
 		allowed := map[string]string{"keyword": "keyword", "username": "username", "next_marker": "next_marker"}
+		if method == "finderSearch" {
+			allowed["type"] = "type"
+		}
 		query := make(url.Values, len(values)+1)
 		for key, value := range values {
 			queryKey, exists := allowed[key]
@@ -136,7 +139,16 @@ func (c *LtaooClient) Call(ctx context.Context, method string, body any) ([]byte
 			if query.Get("keyword") == "" {
 				return nil, CategorizedError{Category: ErrorSafety}
 			}
-			query.Set("type", "3")
+			// The running wx_channel bridge exposes one contact-search route and
+			// dispatches its finder scene from type: 1/2 use scene 13, while 3
+			// uses the video scene 19. Keep type=3 on this route so the bridge
+			// receives the scene selector instead of silently defaulting to an
+			// account search.
+			if query.Get("type") == "" {
+				query.Set("type", "3")
+			} else if query.Get("type") != "1" && query.Get("type") != "2" && query.Get("type") != "3" {
+				return nil, CategorizedError{Category: ErrorSafety}
+			}
 		} else {
 			path = "/api/channels/contact/feed/list"
 			if query.Get("username") == "" {
@@ -382,14 +394,27 @@ func CollectWorksFromURLs(ctx context.Context, client *LtaooClient, rawURLs []st
 	})
 }
 
-// CollectWorksFromSearch discovers works through finderSearch and resolves a
-// public share URL for every selected work before publication.
+// CollectWorksFromSearch discovers works through finderSearch. A public share
+// URL is best-effort metadata; work and nonce IDs are the required collection
+// identity for keyword discovery.
 func CollectWorksFromSearch(ctx context.Context, client *LtaooClient, keyword string, limits Limits, store CollectorStore) ([]Work, []Issue) {
-	return collectWorksFromSearch(ctx, client, keyword, limits, store, profileReadinessOptions{
+	works, issues, _ := collectWorksFromSearchWithDiagnostics(ctx, client, keyword, limits, store, profileReadinessOptions{
 		Clock:         batchClock{},
 		Timeout:       searchReadinessTimeout,
 		RetryInterval: searchRetryInterval,
 	})
+	return works, issues
+}
+
+func collectWorksFromSearchWithDiagnostics(
+	ctx context.Context,
+	client *LtaooClient,
+	keyword string,
+	limits Limits,
+	store CollectorStore,
+	readiness profileReadinessOptions,
+) ([]Work, []Issue, []PageDiagnostic) {
+	return collectWorksFromSearchInternal(ctx, client, keyword, limits, store, readiness)
 }
 
 func collectWorksFromSearch(
@@ -400,51 +425,72 @@ func collectWorksFromSearch(
 	store CollectorStore,
 	readiness profileReadinessOptions,
 ) ([]Work, []Issue) {
+	works, issues, _ := collectWorksFromSearchInternal(ctx, client, keyword, limits, store, readiness)
+	return works, issues
+}
+
+func collectWorksFromSearchInternal(
+	ctx context.Context,
+	client *LtaooClient,
+	keyword string,
+	limits Limits,
+	store CollectorStore,
+	readiness profileReadinessOptions,
+) ([]Work, []Issue, []PageDiagnostic) {
 	if client == nil || strings.TrimSpace(keyword) == "" || limits.Works < 1 || limits.Works > 30 || store == nil ||
 		readiness.Clock == nil || readiness.Timeout <= 0 || readiness.RetryInterval <= 0 {
-		return nil, []Issue{{Stage: "content", Code: "invalid_collection_request"}}
+		return nil, []Issue{{Stage: "content", Code: "invalid_collection_request"}}, nil
 	}
 	collectorOptions := DefaultOptions()
 	collectorOptions.Keyword = strings.TrimSpace(keyword)
 	collectorOptions.Limits = limits
+	collectorOptions.RequireVideoWorks = true
 	deadline := readiness.Clock.Now().Add(readiness.Timeout)
 	var works []Work
+	diagnostics := make([]PageDiagnostic, 0)
+	coverage := CoverageIncomplete
 	for {
 		collector := NewCollector(client, NewEvidenceRecorder(nil), store, readiness.Clock)
 		var err error
-		works, _, err = collector.CollectWorks(ctx, collectorOptions)
+		works, coverage, err = collector.CollectWorks(ctx, collectorOptions)
+		diagnostics = append(diagnostics, collector.drainPageDiagnostics()...)
 		if err == nil {
 			break
 		}
 		if ctx.Err() != nil {
-			return works, []Issue{{Stage: "content", Code: "collection_cancelled"}}
+			return works, []Issue{{Stage: "content", Code: "collection_cancelled"}}, diagnostics
 		}
 		if ClassifyError(err) != ErrorTransient {
-			return works, []Issue{{Stage: "content", Code: profileIssueCode(err)}}
+			return works, []Issue{{Stage: "content", Code: profileIssueCode(err)}}, diagnostics
 		}
 		remaining := deadline.Sub(readiness.Clock.Now())
 		if remaining <= 0 {
-			return works, []Issue{{Stage: "content", Code: "profile_not_ready"}}
+			return works, []Issue{{Stage: "content", Code: "profile_not_ready"}}, diagnostics
 		}
 		if err := readiness.Clock.Sleep(ctx, min(readiness.RetryInterval, remaining)); err != nil {
-			return works, []Issue{{Stage: "content", Code: "collection_cancelled"}}
+			return works, []Issue{{Stage: "content", Code: "collection_cancelled"}}, diagnostics
 		}
 	}
-	issues := make([]Issue, 0)
+	issues := make([]Issue, 0, 1)
+	if coverage == CoverageIncomplete {
+		issues = append(issues, Issue{Stage: "content", Code: "search_incomplete"})
+	}
 	resolved := make([]Work, 0, len(works))
 	for index := range works {
-		if works[index].WorkID == nil {
+		if works[index].WorkID == nil || dereferenceString(works[index].WorkID) == "" ||
+			works[index].ObjectNonceID == nil || dereferenceString(works[index].ObjectNonceID) == "" {
+			issues = append(issues, Issue{Stage: "content", Code: "work_identity_unavailable", InputIndex: index + 1})
 			continue
 		}
 		shareURL, resolveErr := client.ResolveShareURL(ctx, dereferenceString(works[index].WorkID))
 		if resolveErr != nil {
 			issues = append(issues, Issue{Stage: "content", Code: "share_url_unavailable", InputIndex: index + 1})
-			continue
+		} else {
+			works[index].Locator.PublicURL = stringPointer(shareURL)
 		}
-		works[index].Locator.PublicURL = stringPointer(shareURL)
 		resolved = append(resolved, works[index])
 	}
-	return resolved, issues
+	return resolved, issues, diagnostics
 }
 
 func collectWorksFromURLs(

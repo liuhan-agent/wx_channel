@@ -566,24 +566,75 @@ function New-LtaooRunCertificate {
     } finally { $rsa.Dispose() }
 }
 
+function Test-LtaooCurrentUserCA {
+    param([Parameter(Mandatory = $true)][string]$Thumbprint)
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root', [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    try {
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+        $matches = $store.Certificates.Find([Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $Thumbprint, $false)
+        return $matches.Count -eq 1
+    } catch {
+        return $false
+    } finally {
+        $store.Close()
+        $store.Dispose()
+    }
+}
+
+function Wait-LtaooCurrentUserCA {
+    param(
+        [Parameter(Mandatory = $true)][string]$Thumbprint,
+        [ValidateRange(0, 120000)][int]$TimeoutMilliseconds = 5000,
+        [ValidateRange(1, 1000)][int]$PollMilliseconds = 100
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        if (Test-LtaooCurrentUserCA -Thumbprint $Thumbprint) { return $true }
+        $remaining = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remaining -le 0) { break }
+        Start-Sleep -Milliseconds ([Math]::Min($PollMilliseconds, [int][Math]::Ceiling($remaining)))
+    } while ($true)
+    return Test-LtaooCurrentUserCA -Thumbprint $Thumbprint
+}
+
 function Install-LtaooCurrentUserCA {
     param([Parameter(Mandatory = $true)][string]$CertificatePath, [Parameter(Mandatory = $true)][string]$Thumbprint)
-    & certutil.exe -user -addstore Root $CertificatePath *> $null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath ('Cert:\CurrentUser\Root\' + $Thumbprint))) { throw 'ca_install_failed' }
+    $process = Start-Process -FilePath 'certutil.exe' -ArgumentList @('-user', '-addstore', 'Root', $CertificatePath) -PassThru -WindowStyle Hidden
+    try {
+        if (-not $process.WaitForExit(120000)) {
+            try { $process.Kill() } catch { }
+            throw 'ca_install_timeout'
+        }
+        if ($process.ExitCode -ne 0 -or -not (Wait-LtaooCurrentUserCA -Thumbprint $Thumbprint)) { throw 'ca_install_failed' }
+    } finally { $process.Dispose() }
 }
 
 function Remove-LtaooCurrentUserCA {
     param([Parameter(Mandatory = $true)][string]$Thumbprint)
-    if (Test-Path -LiteralPath ('Cert:\CurrentUser\Root\' + $Thumbprint)) {
-        & certutil.exe -user -delstore Root $Thumbprint *> $null
-    }
-    return -not (Test-Path -LiteralPath ('Cert:\CurrentUser\Root\' + $Thumbprint))
+    $deadline = [DateTime]::UtcNow.AddMilliseconds(5000)
+    $observed = $false
+    do {
+        $present = Test-LtaooCurrentUserCA -Thumbprint $Thumbprint
+        if ($present) {
+            $observed = $true
+            & certutil.exe -user -delstore Root $Thumbprint *> $null
+        }
+        if (-not (Test-LtaooCurrentUserCA -Thumbprint $Thumbprint)) {
+            if ($observed) { return $true }
+            $remaining = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remaining -le 0) { return $true }
+        }
+        $remaining = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remaining -le 0) { break }
+        Start-Sleep -Milliseconds ([Math]::Min(100, [int][Math]::Ceiling($remaining)))
+    } while ($true)
+    return -not (Test-LtaooCurrentUserCA -Thumbprint $Thumbprint)
 }
 
 Export-ModuleMember -Function @(
     'Get-LtaooFileHash', 'Get-LtaooStringHash', 'Get-LtaooRuntimePathsHash', 'Assert-LtaooNoReparseInPath', 'Assert-LtaooNoReparsePoint', 'Assert-LtaooAllowedProperties',
     'Read-LtaooStrictJson', 'Assert-LtaooOwnerOnlyAcl', 'Use-LtaooRunGrant', 'Add-LtaooClashBlock', 'Remove-LtaooClashBlock',
     'Get-ClashRecoveryAction', 'ConvertFrom-LtaooUtf8Bytes', 'ConvertTo-LtaooUtf8Bytes', 'Test-LtaooProcessIdentity', 'Test-LtaooProcessIdentityOrAbsent', 'Wait-LtaooProcessStopped', 'Get-LtaooClashController', 'Test-LtaooClashConfig', 'Invoke-LtaooClashReload',
-    'Write-LtaooBytesAtomic', 'Write-LtaooJsonAtomic', 'New-LtaooRunCertificate', 'Install-LtaooCurrentUserCA',
+    'Write-LtaooBytesAtomic', 'Write-LtaooJsonAtomic', 'New-LtaooRunCertificate', 'Test-LtaooCurrentUserCA', 'Wait-LtaooCurrentUserCA', 'Install-LtaooCurrentUserCA',
     'Remove-LtaooCurrentUserCA', 'Set-LtaooOwnerOnlyAcl'
 )

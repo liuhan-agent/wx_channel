@@ -303,7 +303,10 @@ func (app *App) Run() {
 	go app.WSHub.Run()
 	utils.Info("✓ WebSocket Hub 已启动")
 
-	wsPort := app.Port + 1
+	wsPort := app.Cfg.APIPort
+	if wsPort == 0 {
+		wsPort = app.Port + 1
+	}
 	go app.startWebSocketServer(wsPort)
 
 	// 启动 Prometheus 监控服务器（如果启用）

@@ -558,7 +558,7 @@ $rect = [TrendRadar.WeChatChannelAutomation+RECT]::new()
 $main.Left = $rect.Left; $main.Top = $rect.Top; $main.Width = $rect.Right - $rect.Left; $main.Height = $rect.Bottom - $rect.Top
 if ($main.Width -lt 500 -or $main.Height -lt 400) { throw 'wechat_window_invalid_size' }
 
-if (-not $browserHostReady) {
+if (-not $EntryOnly -and -not $browserHostReady) {
     $compatibilityFailure = $null
     try {
         $bitmap = Get-WindowBitmap -Window $main
@@ -568,10 +568,6 @@ if (-not $browserHostReady) {
             -TemplateNames @('wechat-discover-entry-active-template.b64', 'wechat-discover-entry-inactive-template.b64') `
             -ReferenceX 59 -ReferenceY 512 -Scales $entryScales -PixelRadius 2
         Write-Verbose ("discover-entry window={0} best={1},{2} template={3} scale={4} score={5} combined={6}" -f $main.HandleText, $discover.X, $discover.Y, $discover.TemplateName, $discover.TemplateScale, $discover.TemplateScore, $discover.CombinedScore)
-        # The current Weixin build renders the compass in a low-contrast gray
-        # state. Its fixed geometry remains stable, but the inactive template
-        # score is lower than the active green asset, so keep a conservative
-        # evidence floor while allowing the known coordinate to win.
         if ($discover.TemplateScore -ge 0.20) {
             Invoke-WindowClick -Window $main -X $discover.X -Y $discover.Y
 
@@ -684,6 +680,10 @@ if ($EntryOnly) {
     if (-not [TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYDOWN, [IntPtr]0x74, [IntPtr]::Zero)) { throw 'wechat_page_refresh_failed' }
     [void][TrendRadar.WeChatChannelAutomation]::PostMessage($webView.Handle, [TrendRadar.WeChatChannelAutomation]::WM_KEYUP, [IntPtr]0x74, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 500
+    if ($Refresh) {
+        'wechat_page_refresh_sent'
+        return
+    }
     'wechat_channel_entry_sent'
     return
 }

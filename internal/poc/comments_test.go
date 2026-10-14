@@ -86,6 +86,149 @@ func TestTopLevelRepeatedMarkerWithNewCommentsRemainsPartial(t *testing.T) {
 	}
 }
 
+func TestEmptyCommentPageWithZeroCountAndMissingMarkerIsComplete(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":0}}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-zero-count-missing-marker-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-zero-count-missing-marker-work", "empty-zero-count-missing-marker-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 0 || summary.TopLevel != 0 || summary.Partial || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithExplicitEndIsComplete(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":0},"lastBuffer":""}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-explicit-end-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-explicit-end-work", "empty-explicit-end-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 0 || summary.TopLevel != 0 || summary.Partial || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestNonEmptyCommentPageWithMissingMarkerAndReportedCountReachedIsComplete(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[{"commentId":"fixture-counted-one"},{"commentId":"fixture-counted-two"}],"countInfo":{"commentCount":2}}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "counted-missing-marker-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("counted-missing-marker-work", "counted-missing-marker-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 2 || summary.TopLevel != 2 || summary.Partial || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithMissingMarkerAndUnknownCountIsPartial(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[]}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-unknown-count-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-unknown-count-work", "empty-unknown-count-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 0 || summary.TopLevel != 0 || !summary.Partial || !containsReason(summary.Reasons, "comment_pagination_incomplete") || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithMissingMarkerAndNonZeroCountIsPartial(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":3}}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-nonzero-count-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-nonzero-count-work", "empty-nonzero-count-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 0 || summary.TopLevel != 0 || !summary.Partial || !containsReason(summary.Reasons, "comment_pagination_incomplete") || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageAfterCollectedCommentsIsPartialEvenWithZeroCount(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		commentPage(t, []map[string]any{{"commentId": "fixture-existing-root"}}, "fixture-next-page"),
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":0}}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-after-comments-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-after-comments-work", "empty-after-comments-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 1 || summary.TopLevel != 1 || !summary.Partial || !containsReason(summary.Reasons, "comment_pagination_incomplete") || api.calls != 2 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithTotalCountReachedByEmbeddedReplyIsComplete(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[{"commentId":"fixture-total-root","expandCommentCount":1,"levelTwoComment":[{"commentId":"fixture-total-reply"}]}],"countInfo":{"commentCount":2},"lastBuffer":"fixture-total-next"}}`),
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":2},"lastBuffer":"fixture-total-next"}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "total-count-embedded-reply-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("total-count-embedded-reply-work", "total-count-embedded-reply-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 2 || summary.TopLevel != 1 || summary.Replies != 1 || summary.Partial || api.calls != 2 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithNonEmptyMarkerIsPartial(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":1},"lastBuffer":"unexpected-cursor"}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-nonempty-marker-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-nonempty-marker-work", "empty-nonempty-marker-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 0 || summary.TopLevel != 0 || !summary.Partial || !containsReason(summary.Reasons, "comment_pagination_incomplete") || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithZeroCountAndStaleMarkerIsComplete(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":0},"lastBuffer":"stale-cursor"}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-zero-count-stale-marker-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-zero-count-stale-marker-work", "empty-zero-count-stale-marker-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 0 || summary.TopLevel != 0 || summary.Partial || api.calls != 1 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
+func TestEmptyCommentPageWithNonAdvancingMarkerIsPartial(t *testing.T) {
+	api := &fixturePageAPI{responses: [][]byte{
+		commentPage(t, []map[string]any{{"commentId": "fixture-first-root"}}, "fixture-stalled-cursor"),
+		[]byte(`{"data":{"commentInfo":[],"countInfo":{"commentCount":0},"lastBuffer":"fixture-stalled-cursor"}}`),
+	}}
+	collector := NewCollector(api, NewEvidenceRecorder(nil), newTestStore(t, "empty-stalled-marker-job"), &fixtureClock{})
+	comments, summary, err := collector.CollectComments(context.Background(), approvedTestOptions(), fixtureWork("empty-stalled-marker-work", "empty-stalled-marker-nonce", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 1 || summary.TopLevel != 1 || !summary.Partial || !containsReason(summary.Reasons, "comment_pagination_incomplete") || api.calls != 2 {
+		t.Fatalf("comments=%+v summary=%+v calls=%d", comments, summary, api.calls)
+	}
+}
+
 func TestReplyRepeatedMarkerWithNoNewReplies(t *testing.T) {
 	top := []map[string]any{{"commentId": "fixture-reply-repeat-root", "expandCommentCount": 2}}
 	reply := []map[string]any{{"commentId": "fixture-reply-repeat-one", "replyCommentId": "fixture-reply-repeat-root", "rootCommentId": "fixture-reply-repeat-root"}}

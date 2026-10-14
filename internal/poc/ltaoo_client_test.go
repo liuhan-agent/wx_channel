@@ -103,7 +103,7 @@ func TestLtaooClientMapsStatusProfileAndContinuousCommentCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, marker, present, _, err := parseCommentPage(first)
+	_, marker, present, _, _, err := parseCommentPage(first)
 	if err != nil || !present || marker != "fixture-next-marker" {
 		t.Fatalf("marker=%q present=%t err=%v", marker, present, err)
 	}
@@ -113,7 +113,7 @@ func TestLtaooClientMapsStatusProfileAndContinuousCommentCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	items, finalMarker, present, _, err := parseCommentPage(second)
+	items, finalMarker, present, _, _, err := parseCommentPage(second)
 	if err != nil || !present || finalMarker != "" || len(items) != 1 {
 		t.Fatalf("items=%d marker=%q present=%t err=%v", len(items), finalMarker, present, err)
 	}
@@ -125,7 +125,7 @@ func TestLtaooClientMapsStatusProfileAndContinuousCommentCursor(t *testing.T) {
 	}
 }
 
-func TestLtaooClientSupportsFinderSearchFeedAndShareURL(t *testing.T) {
+func TestLtaooClientSupportsFinderSearchAndShareURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -138,7 +138,7 @@ func TestLtaooClientSupportsFinderSearchFeedAndShareURL(t *testing.T) {
 			if r.URL.Query().Get("username") != "finder-alice" {
 				t.Fatalf("feed query=%s", r.URL.RawQuery)
 			}
-			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"work-1","objectNonceId":"nonce-1","objectDesc":{"mediaType":2}}],"lastBuffer":""}}}`)
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"work-1","objectNonceId":"nonce-1","objectDesc":{"mediaType":4}}],"lastBuffer":""}}}`)
 		case "/api/channels/feed/share_url":
 			if r.URL.Query().Get("oid") != "work-1" {
 				t.Fatalf("share query=%s", r.URL.RawQuery)
@@ -172,6 +172,39 @@ func TestLtaooClientSupportsFinderSearchFeedAndShareURL(t *testing.T) {
 	share, err := client.ResolveShareURL(context.Background(), "work-1")
 	if err != nil || share != "https://weixin.qq.com/sph/generated-1" {
 		t.Fatalf("share=%q err=%v", share, err)
+	}
+}
+
+func TestLtaooClientForwardsFinderSearchType(t *testing.T) {
+	var queryTypes []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/channels/contact/search" {
+			http.NotFound(w, r)
+			return
+		}
+		queryTypes = append(queryTypes, r.URL.Query().Get("type"))
+		if r.URL.Query().Get("type") == "3" && r.URL.Path != "/api/channels/contact/search" {
+			t.Fatalf("video search path=%q", r.URL.Path)
+		}
+		if r.URL.Query().Get("type") == "1" && r.URL.Path != "/api/channels/contact/search" {
+			t.Fatalf("account search path=%q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"infoList":[],"lastBuff":""}}}`)
+	}))
+	defer server.Close()
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Call(context.Background(), "finderSearch", map[string]any{"keyword": "账号搜索", "type": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Call(context.Background(), "finderSearch", map[string]any{"keyword": "视频搜索", "type": 3}); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(queryTypes) != "[1 3]" {
+		t.Fatalf("query types=%v", queryTypes)
 	}
 }
 
@@ -213,13 +246,16 @@ func TestCollectWorksFromSearchUsesReadinessWindow(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/channels/contact/search":
 			searchRequests++
+			if r.URL.Query().Get("type") != "3" {
+				t.Errorf("video search type=%q, want 3", r.URL.Query().Get("type"))
+			}
 			if searchRequests <= 3 {
 				_, _ = fmt.Fprint(w, `{"code":400,"data":null}`)
 				return
 			}
 			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"infoList":[{"contact":{"username":"ready-account"}}],"lastBuff":""}}}`)
 		case "/api/channels/contact/feed/list":
-			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"ready-search-work","objectNonceId":"ready-search-nonce","objectDesc":{"description":"ready search work","mediaType":2}}],"lastBuffer":""}}}`)
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"ready-search-work","objectNonceId":"ready-search-nonce","objectDesc":{"description":"ready search work","mediaType":4}}],"lastBuffer":""}}}`)
 		case "/api/channels/feed/share_url":
 			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":"https://weixin.qq.com/sph/ready-search"}}}`)
 		default:
@@ -244,6 +280,120 @@ func TestCollectWorksFromSearchUsesReadinessWindow(t *testing.T) {
 	}
 	if len(clock.sleeps) < 3 {
 		t.Fatalf("sleeps=%v", clock.sleeps)
+	}
+}
+
+func TestCollectWorksFromSearchKeepsWorkWhenShareURLUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/channels/contact/search":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"infoList":[{"contact":{"username":"without-share-account"}}],"lastBuff":""}}}`)
+		case "/api/channels/contact/feed/list":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"object":[{"id":"work-without-share","objectNonceId":"nonce-without-share","objectDesc":{"description":"without share","mediaType":4}}],"lastBuffer":""}}}`)
+		case "/api/channels/feed/share_url":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":"https://example.com/not-a-wechat-share"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	works, issues := collectWorksFromSearch(
+		context.Background(), client, "无分享链接", Limits{Works: 1, TopLevelCommentsPerWork: 1},
+		newTestStore(t, "share-url-unavailable"), profileReadinessOptions{
+			Clock:         &profileTestClock{now: time.Unix(900, 0)},
+			Timeout:       time.Second,
+			RetryInterval: time.Millisecond,
+		},
+	)
+	if len(works) != 1 || dereference(works[0].WorkID) != "work-without-share" {
+		t.Fatalf("works=%+v", works)
+	}
+	if works[0].Locator.PublicURL != nil {
+		t.Fatalf("public URL = %v, want nil", works[0].Locator.PublicURL)
+	}
+	if len(issues) != 1 || issues[0].Code != "share_url_unavailable" {
+		t.Fatalf("issues=%+v", issues)
+	}
+}
+
+func TestCollectWorksFromSearchSkipsUnknownMedia(t *testing.T) {
+	searchRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/channels/contact/search":
+			searchRequests++
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"objectList":[
+				{"id":"live-result","objectNonceId":"live-nonce","objectDesc":{"mediaType":9}},
+				{"id":"video-result","objectNonceId":"video-nonce","objectDesc":{"mediaType":4}}
+			],"lastBuffer":""}}}`)
+		case "/api/channels/feed/share_url":
+			if r.URL.Query().Get("oid") != "video-result" {
+				t.Fatalf("share URL requested for %q", r.URL.Query().Get("oid"))
+			}
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"errCode":0,"data":{"feedH5Url":"https://weixin.qq.com/sph/video-result"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	works, issues := collectWorksFromSearch(
+		context.Background(), client, "未知结果后找视频", Limits{Works: 1, TopLevelCommentsPerWork: 1},
+		newTestStore(t, "skip-unknown-media"), profileReadinessOptions{
+			Clock:         &profileTestClock{now: time.Unix(1200, 0)},
+			Timeout:       time.Second,
+			RetryInterval: time.Millisecond,
+		},
+	)
+	if len(works) != 1 || dereference(works[0].WorkID) != "video-result" || works[0].MediaType.Normalized != "video" {
+		t.Fatalf("works=%+v", works)
+	}
+	if len(issues) != 0 || searchRequests != 1 {
+		t.Fatalf("issues=%+v searchRequests=%d", issues, searchRequests)
+	}
+}
+
+func TestCollectWorksFromSearchReportsIncompleteSearch(t *testing.T) {
+	searchRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/channels/contact/search":
+			searchRequests++
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"errCode":0,"data":{"objectList":[
+				{"id":"non-video-%d","objectNonceId":"nonce-%d","objectDesc":{"mediaType":9}}
+			],"lastBuffer":"cursor-%d"}}}`, searchRequests, searchRequests, searchRequests)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewLtaooClient(server.URL, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	works, issues := collectWorksFromSearch(
+		context.Background(), client, "无有效视频", Limits{Works: 1, TopLevelCommentsPerWork: 1},
+		newTestStore(t, "incomplete-search"), profileReadinessOptions{
+			Clock:         &profileTestClock{now: time.Unix(1500, 0)},
+			Timeout:       time.Minute,
+			RetryInterval: time.Millisecond,
+		},
+	)
+	if len(works) != 0 || searchRequests != maxFinderSearchNoProgressPages {
+		t.Fatalf("works=%+v searchRequests=%d", works, searchRequests)
+	}
+	if len(issues) != 1 || issues[0].Code != "search_incomplete" {
+		t.Fatalf("issues=%+v", issues)
 	}
 }
 

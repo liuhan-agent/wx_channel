@@ -9,6 +9,7 @@ import (
 	"io"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -43,6 +44,7 @@ type Collector struct {
 	readySignal     func(WaitReason, int) <-chan struct{}
 	currentWorkRank int
 	mediaCandidates []commentMediaCandidate
+	pageDiagnostics []PageDiagnostic
 }
 
 type searchContact struct {
@@ -55,6 +57,23 @@ type searchPage struct {
 	contacts      []searchContact
 	nextMarker    string
 	markerPresent bool
+}
+
+const (
+	// Search results can contain a long tail of duplicate or non-video records
+	// while the bridge keeps advancing its cursor. Bound that tail so a stalled
+	// search cannot consume the whole provider timeout.
+	maxFinderSearchNoProgressPages = 8
+	minFinderSearchPages           = 20
+	finderSearchPagesPerWork       = 10
+)
+
+func maxFinderSearchPages(workLimit int) int {
+	limit := workLimit * finderSearchPagesPerWork
+	if limit < minFinderSearchPages {
+		return minFinderSearchPages
+	}
+	return limit
 }
 
 func NewCollector(api PageAPI, evidence *EvidenceRecorder, store CollectorStore, clock Clock) *Collector {
@@ -75,6 +94,15 @@ func (c *Collector) drainCommentMediaCandidates() []commentMediaCandidate {
 	candidates := append([]commentMediaCandidate(nil), c.mediaCandidates...)
 	c.mediaCandidates = nil
 	return candidates
+}
+
+func (c *Collector) drainPageDiagnostics() []PageDiagnostic {
+	if c == nil || len(c.pageDiagnostics) == 0 {
+		return nil
+	}
+	diagnostics := append([]PageDiagnostic(nil), c.pageDiagnostics...)
+	c.pageDiagnostics = nil
+	return diagnostics
 }
 
 func (c *Collector) ConfigureHumanWait(waiter *WaitController, readySignal func(WaitReason, int) <-chan struct{}) {
@@ -101,6 +129,7 @@ func (c *Collector) call(ctx context.Context, method string, body any) ([]byte, 
 	if err != nil {
 		return nil, SourceRef{}, err
 	}
+	c.pageDiagnostics = append(c.pageDiagnostics, summarizePageResponse(method, raw))
 	c.sequence++
 	evidence, err := c.evidence.Observe(c.sequence, method, raw)
 	if err != nil {
@@ -162,6 +191,9 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 	works := make([]Work, 0, options.Limits.Works)
 	marker := ""
 	pageNumber := 0
+	searchPages := 0
+	noProgressPages := 0
+	maxSearchPages := maxFinderSearchPages(options.Limits.Works)
 	if checkpoint, ok, err := c.searchCheckpoint(); err != nil {
 		return nil, CoverageIncomplete, err
 	} else if ok {
@@ -189,8 +221,20 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 		}
 	}
 	for len(works) < options.Limits.Works {
+		if searchPages >= maxSearchPages {
+			if err := c.saveSearchCheckpoint("search_incomplete", marker, works); err != nil {
+				return works, CoverageIncomplete, err
+			}
+			return works, CoverageIncomplete, nil
+		}
 		pageNumber++
-		raw, source, err := c.call(ctx, "finderSearch", map[string]any{"keyword": options.Keyword, "next_marker": marker})
+		searchPages++
+		worksBeforePage := len(works)
+		searchType := 3
+		// Video-only keyword collection uses finderSearch's video scene (type 3).
+		// Account/live scenes return mediaType=9 cards; those are not commentable
+		// video works and must not displace the requested video results.
+		raw, source, err := c.call(ctx, "finderSearch", map[string]any{"keyword": options.Keyword, "type": searchType, "next_marker": marker})
 		if err != nil {
 			if checkpointErr := c.saveSearchCheckpoint("search", marker, works); checkpointErr != nil {
 				return works, CoverageIncomplete, checkpointErr
@@ -213,6 +257,9 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 				continue
 			}
 			seenIDs[id] = struct{}{}
+			if options.RequireVideoWorks && mapSearchMedia(item).Normalized != "video" {
+				continue
+			}
 			rank := len(works) + 1
 			itemSource := source
 			itemSource.Ordinal = index + 1
@@ -241,6 +288,7 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 					feedIncomplete = true
 					break
 				}
+				acceptedOnPage := 0
 				for itemIndex, item := range feedItems {
 					if item == nil {
 						continue
@@ -256,15 +304,33 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 						continue
 					}
 					seenIDs[id] = struct{}{}
+					if options.RequireVideoWorks && mapSearchMedia(item).Normalized != "video" {
+						continue
+					}
 					rank := len(works) + 1
 					itemSource := feedSource
 					itemSource.Ordinal = itemIndex + 1
 					works = append(works, mapSearchWork(item, id, options.Keyword, rank, pageNumber+contactIndex+1, itemIndex+1, itemSource))
+					acceptedOnPage++
 					if len(works) == options.Limits.Works {
 						break
 					}
 				}
-				if !feedMarkerPresent || nextFeedMarker == "" {
+				if !feedMarkerPresent {
+					// A missing marker is not an explicit end-of-feed signal.
+					feedIncomplete = true
+					break
+				}
+				if nextFeedMarker == "" {
+					break
+				}
+				if strings.TrimSpace(nextFeedMarker) == "" ||
+					strings.TrimSpace(nextFeedMarker) == strings.TrimSpace(feedMarker) ||
+					acceptedOnPage == 0 {
+					// Do not follow a blank, stalled, or no-progress cursor. A
+					// changing cursor on an empty/duplicate page is not proof that
+					// another usable page exists and can otherwise loop forever.
+					feedIncomplete = true
 					break
 				}
 				if _, repeated := seenFeedMarkers[nextFeedMarker]; repeated {
@@ -281,6 +347,11 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 			}
 			return works, CoverageTargetMet, nil
 		}
+		if len(works) == worksBeforePage {
+			noProgressPages++
+		} else {
+			noProgressPages = 0
+		}
 		if !page.markerPresent {
 			if err := c.saveSearchCheckpoint("search_incomplete", "", works); err != nil {
 				return works, CoverageIncomplete, err
@@ -291,10 +362,25 @@ func (c *Collector) CollectWorks(ctx context.Context, options Options) ([]Work, 
 			return works, CoverageIncomplete, nil
 		}
 		if page.nextMarker == "" {
-			if err := c.saveSearchCheckpoint("search_complete", "", works); err != nil {
+			phase := "search_complete"
+			if feedIncomplete {
+				phase = "search_incomplete"
+			}
+			if err := c.saveSearchCheckpoint(phase, "", works); err != nil {
 				return works, CoverageIncomplete, err
 			}
+			if feedIncomplete {
+				return works, CoverageIncomplete, nil
+			}
 			return works, CoverageSourceExhausted, nil
+		}
+		if strings.TrimSpace(page.nextMarker) == "" ||
+			(strings.TrimSpace(marker) != "" && strings.TrimSpace(page.nextMarker) == strings.TrimSpace(marker)) ||
+			noProgressPages >= maxFinderSearchNoProgressPages || searchPages >= maxSearchPages {
+			if err := c.saveSearchCheckpoint("search_incomplete", page.nextMarker, works); err != nil {
+				return works, CoverageIncomplete, err
+			}
+			return works, CoverageIncomplete, nil
 		}
 		if _, repeated := seenMarkers[page.nextMarker]; repeated {
 			if err := c.saveSearchCheckpoint("search_incomplete", page.nextMarker, works); err != nil {
@@ -495,7 +581,9 @@ func mapSearchMedia(item map[string]any) MediaType {
 	if description, ok := item["objectDesc"].(map[string]any); ok {
 		media.RawCode = description["mediaType"]
 		switch fmt.Sprint(media.RawCode) {
-		case "2", "4":
+		case "2":
+			media.Normalized = "picture"
+		case "4":
 			media.Normalized = "video"
 		}
 	}

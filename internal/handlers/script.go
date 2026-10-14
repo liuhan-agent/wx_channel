@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 // ScriptHandler JavaScript注入处理器
 type ScriptHandler struct {
+	cfg             *config.Config
 	coreJS          []byte
 	decryptJS       []byte
 	downloadJS      []byte
@@ -40,6 +42,7 @@ type ScriptHandler struct {
 // NewScriptHandler 创建脚本处理器
 func NewScriptHandler(cfg *config.Config, coreJS, decryptJS, downloadJS, homeJS, feedJS, profileJS, batchDownloadJS, zipJS, fileSaverJS, mittJS, eventbusJS, utilsJS, apiClientJS, keepAliveJS []byte, version string) *ScriptHandler {
 	return &ScriptHandler{
+		cfg:             cfg,
 		coreJS:          coreJS,
 		decryptJS:       decryptJS,
 		downloadJS:      downloadJS,
@@ -60,6 +63,9 @@ func NewScriptHandler(cfg *config.Config, coreJS, decryptJS, downloadJS, homeJS,
 
 // getConfig 获取当前配置（动态获取最新配置）
 func (h *ScriptHandler) getConfig() *config.Config {
+	if h != nil && h.cfg != nil {
+		return h.cfg
+	}
 	return config.Get()
 }
 
@@ -203,8 +209,9 @@ func (h *ScriptHandler) buildInjectedScripts(path string) string {
 	eventbusScript := fmt.Sprintf(`<script>%s</script>`, string(h.eventbusJS))
 	utilsScript := fmt.Sprintf(`<script>%s</script>`, string(h.utilsJS))
 
-	// API 客户端脚本 - 必须在其他脚本之前加载
-	apiClientScript := fmt.Sprintf(`<script>%s</script>`, string(h.apiClientJS))
+	// API 客户端脚本 - 必须在其他脚本之前加载。API 端口来自本轮运行配置，
+	// 不能让页面继续使用旧的固定 2026 端口。
+	apiClientScript := h.getAPIClientConfigScript() + fmt.Sprintf(`<script>%s</script>`, string(h.apiClientJS))
 
 	// 页面保活脚本 - 防止页面休眠
 	keepAliveScript := fmt.Sprintf(`<script>%s</script>`, string(h.keepAliveJS))
@@ -276,6 +283,37 @@ setTimeout(function() {
 </script>`
 
 	return baseScripts + pageSpecificScripts + initScript
+}
+
+// getAPIClientConfigScript 将本轮运行的本地 API 配置放到页面桥之前。
+// TrendRadar 会为每轮运行生成独立的 api.port；页面端必须使用同一个端口。
+func (h *ScriptHandler) getAPIClientConfigScript() string {
+	cfg := h.getConfig()
+	if cfg == nil {
+		return ""
+	}
+
+	apiPort := cfg.APIPort
+	if apiPort == 0 {
+		apiPort = cfg.Port + 1
+	}
+	if apiPort < 1 || apiPort > 65535 {
+		return ""
+	}
+
+	configValue := struct {
+		APIPort int    `json:"apiPort"`
+		Token   string `json:"token,omitempty"`
+	}{
+		APIPort: apiPort,
+		Token:   cfg.SecretToken,
+	}
+	encoded, err := json.Marshal(configValue)
+	if err != nil {
+		return ""
+	}
+
+	return fmt.Sprintf(`<script>window.__WX_CHANNEL_API_CONFIG__=%s;if(window.__WX_CHANNEL_API_CONFIG__.token){window.__WX_LOCAL_TOKEN__=window.__WX_CHANNEL_API_CONFIG__.token;}</script>`, encoded)
 }
 
 // getPreloadScript 获取预加载FileSaver.js库的脚本

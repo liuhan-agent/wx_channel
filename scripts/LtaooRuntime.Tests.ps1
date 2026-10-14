@@ -300,4 +300,16 @@ Describe 'TrendRadar ltaoo recovery identity' {
         (Get-Content -Raw -LiteralPath $certificate.PrivateKeyPath) | Should Match ('BEGIN ' + 'PRIVATE KEY')
         (Test-Path -LiteralPath ('Cert:\CurrentUser\Root\' + $certificate.Thumbprint)) | Should Be $false
     }
+
+    It 'waits for the CurrentUser CA to become visible before reporting success' {
+        $secretsRoot = Join-Path $TestDrive 'certificate-install-secrets'
+        $certificate = New-LtaooRunCertificate -RunId 'certificate-install-fixture-1' -SecretsRoot $secretsRoot
+        try {
+            Install-LtaooCurrentUserCA -CertificatePath $certificate.CertificatePath -Thumbprint $certificate.Thumbprint
+            (Test-LtaooCurrentUserCA -Thumbprint $certificate.Thumbprint) | Should Be $true
+        } finally {
+            (Remove-LtaooCurrentUserCA -Thumbprint $certificate.Thumbprint) | Should Be $true
+        }
+        (Test-LtaooCurrentUserCA -Thumbprint $certificate.Thumbprint) | Should Be $false
+    }
 }

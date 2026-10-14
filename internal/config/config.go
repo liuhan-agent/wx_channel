@@ -21,6 +21,18 @@ type Config struct {
 	// 网络配置
 	Port        int `mapstructure:"port"`
 	DefaultPort int `mapstructure:"default_port"`
+	APIPort     int `mapstructure:"api_port"`
+	API         struct {
+		Protocol string `mapstructure:"protocol"`
+		Hostname string `mapstructure:"hostname"`
+		Port     int    `mapstructure:"port"`
+	} `mapstructure:"api"`
+	Proxy struct {
+		Enabled bool   `mapstructure:"enabled"`
+		System  bool   `mapstructure:"system"`
+		Hostname string `mapstructure:"hostname"`
+		Port     int    `mapstructure:"port"`
+	} `mapstructure:"proxy"`
 
 	// 应用信息
 	Version string `mapstructure:"version"`
@@ -193,6 +205,12 @@ func loadConfig() *Config {
 	loadFromDatabase(config)
 
 	// Fallback: 确保端口有效
+	if config.API.Port != 0 {
+		config.APIPort = config.API.Port
+	}
+	if config.Proxy.Port != 0 {
+		config.Port = config.Proxy.Port
+	}
 	if config.Port == 0 {
 		// 尝试使用 DefaultPort
 		if config.DefaultPort != 0 {
@@ -200,6 +218,9 @@ func loadConfig() *Config {
 		} else {
 			config.Port = 2025
 		}
+	}
+	if config.APIPort == 0 {
+		config.APIPort = config.Port + 1
 	}
 
 	return config

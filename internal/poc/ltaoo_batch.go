@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const BatchSchemaVersion = "wechat-channels-batch/2"
+const BatchSchemaVersion = "wechat-channels-batch/3"
 
 var defaultCommentMediaLimits = CommentMediaLimits{
 	PerComment: 4, PerBatch: 100, PerFileBytes: 8 << 20, Timeout: 10 * time.Second,
@@ -53,13 +53,14 @@ type BatchTargetSummary struct {
 }
 
 type BatchDraftResult struct {
-	SchemaVersion string               `json:"schema_version"`
-	RunID         string               `json:"run_id"`
-	Status        BatchStatus          `json:"status"`
-	Counts        Counts               `json:"counts"`
-	Targets       []BatchTargetSummary `json:"targets"`
-	ReasonCodes   []string             `json:"reason_codes,omitempty"`
-	CompletedAt   time.Time            `json:"completed_at"`
+	SchemaVersion   string               `json:"schema_version"`
+	RunID           string               `json:"run_id"`
+	Status          BatchStatus          `json:"status"`
+	Counts          Counts               `json:"counts"`
+	Targets         []BatchTargetSummary `json:"targets"`
+	ReasonCodes     []string             `json:"reason_codes,omitempty"`
+	PageDiagnostics []PageDiagnostic     `json:"page_diagnostics,omitempty"`
+	CompletedAt     time.Time            `json:"completed_at"`
 }
 
 type BatchCleanupReceipt struct {
@@ -88,16 +89,17 @@ type BatchCleanupSummary struct {
 }
 
 type BatchManifest struct {
-	SchemaVersion string                     `json:"schema_version"`
-	RunID         string                     `json:"run_id"`
-	Status        BatchStatus                `json:"status"`
-	Limits        Limits                     `json:"limits"`
-	Counts        Counts                     `json:"counts"`
-	Targets       []BatchTargetSummary       `json:"targets"`
-	ReasonCodes   []string                   `json:"reason_codes,omitempty"`
-	Cleanup       BatchCleanupSummary        `json:"cleanup"`
-	Files         map[string]BatchFileRecord `json:"files"`
-	CompletedAt   time.Time                  `json:"completed_at"`
+	SchemaVersion   string                     `json:"schema_version"`
+	RunID           string                     `json:"run_id"`
+	Status          BatchStatus                `json:"status"`
+	Limits          Limits                     `json:"limits"`
+	Counts          Counts                     `json:"counts"`
+	Targets         []BatchTargetSummary       `json:"targets"`
+	ReasonCodes     []string                   `json:"reason_codes,omitempty"`
+	PageDiagnostics []PageDiagnostic           `json:"page_diagnostics,omitempty"`
+	Cleanup         BatchCleanupSummary        `json:"cleanup"`
+	Files           map[string]BatchFileRecord `json:"files"`
+	CompletedAt     time.Time                  `json:"completed_at"`
 }
 
 func LoadBatchRequest(requestPath, runRoot string) (BatchRequest, error) {
@@ -229,6 +231,7 @@ func runLtaooBatchWithMedia(
 	works := make([]Work, 0)
 	comments := make([]Comment, 0)
 	mediaAssets := make([]BatchMediaAsset, 0)
+	pageDiagnostics := make([]PageDiagnostic, 0)
 	mediaResolver := newCommentMediaResolver(
 		mediaClient, filepath.Join(draftRoot, "media"), defaultCommentMediaLimits, allowedMediaHosts,
 	)
@@ -240,7 +243,11 @@ func runLtaooBatchWithMedia(
 		if len(request.ContentURLs) > 0 {
 			works, issues = CollectWorksFromURLs(ctx, client, request.ContentURLs, request.Limits.Works)
 		} else {
-			works, issues = CollectWorksFromSearch(ctx, client, request.Keyword, request.Limits, stateStore)
+			var searchDiagnostics []PageDiagnostic
+			works, issues, searchDiagnostics = collectWorksFromSearchWithDiagnostics(ctx, client, request.Keyword, request.Limits, stateStore, profileReadinessOptions{
+				Clock: batchClock{}, Timeout: searchReadinessTimeout, RetryInterval: searchRetryInterval,
+			})
+			pageDiagnostics = append(pageDiagnostics, searchDiagnostics...)
 		}
 		if len(works) == 0 {
 			result.Status = BatchFailed
@@ -251,6 +258,7 @@ func runLtaooBatchWithMedia(
 		works[index].Locator.Keyword = request.Keyword
 		collected, summary, collectErr := collector.CollectComments(ctx, Options{Limits: request.Limits}, works[index])
 		comments = append(comments, collected...)
+		pageDiagnostics = append(pageDiagnostics, collector.drainPageDiagnostics()...)
 		for _, candidate := range collector.drainCommentMediaCandidates() {
 			asset, issue := mediaResolver.ResolveContext(ctx, candidate)
 			if issue != nil {
@@ -296,6 +304,7 @@ func runLtaooBatchWithMedia(
 		}
 	}
 	result.Counts = countBatchRecords(works, comments)
+	result.PageDiagnostics = pageDiagnostics
 	result.CompletedAt = time.Now().UTC()
 	clearEvidenceReferences(works, comments)
 	if err := writeJSONLines(filepath.Join(draftRoot, "contents.jsonl"), works); err != nil {
@@ -365,7 +374,7 @@ func FinalizeLtaooBatch(request BatchRequest, runRoot, cleanupReceiptPath string
 	}
 	manifest := BatchManifest{
 		SchemaVersion: BatchSchemaVersion, RunID: request.RunID, Status: status, Limits: request.Limits,
-		Counts: result.Counts, Targets: result.Targets, ReasonCodes: reasons,
+		Counts: result.Counts, Targets: result.Targets, ReasonCodes: reasons, PageDiagnostics: append([]PageDiagnostic(nil), result.PageDiagnostics...),
 		Cleanup: BatchCleanupSummary{Safe: receipt.Safe, ReasonCodes: append([]string(nil), receipt.ReasonCodes...)},
 		Files:   files, CompletedAt: time.Now().UTC(),
 	}

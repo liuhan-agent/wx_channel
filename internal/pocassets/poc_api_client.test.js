@@ -14,4 +14,6 @@ for (const forbidden of ['console.', 'fetch(', 'commentLike', 'commentPost', 'fi
 }
 assert(source.includes("'target_context_mismatch'"));
 assert(source.includes("'page_api_failed'"));
+assert(source.includes('Number(body.type) === 3 ? 19 : 13'));
+assert(source.includes('lastBuff: body.next_marker ||'));
 assert(!/errMsg\s*:\s*(?:text|error\.message)/.test(source), 'raw error text is sent to the bridge');

@@ -1069,8 +1069,10 @@ func (h *ConsoleAPIHandler) HandleHealth(w http.ResponseWriter, r *http.Request)
 	wsPort := 0
 	if h.getConfig() != nil {
 		version = h.getConfig().Version
-		// WebSocket 运行在代理端口 + 1
-		wsPort = h.getConfig().Port + 1
+		wsPort = h.getConfig().APIPort
+		if wsPort == 0 {
+			wsPort = h.getConfig().Port + 1
+		}
 	}
 
 	status := HealthStatus{

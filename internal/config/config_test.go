@@ -97,6 +97,32 @@ download_dir: "/tmp/downloads"
 	assert.Equal(t, "/tmp/downloads", cfg.DownloadsDir)
 }
 
+func TestLoad_RuntimeAPIPortBecomesAPIPort(t *testing.T) {
+	setupIsolatedTestEnv(t)
+
+	configFile := filepath.Join(t.TempDir(), "ltaoo-runtime.yaml")
+	content := []byte(`
+api:
+  protocol: http
+  hostname: 127.0.0.1
+  port: 2022
+proxy:
+  enabled: true
+  system: false
+  hostname: 127.0.0.1
+  port: 2023
+`)
+	if err := os.WriteFile(configFile, content, 0644); err != nil {
+		t.Fatalf("unable to write runtime config: %v", err)
+	}
+	viper.SetConfigFile(configFile)
+
+	cfg := Load()
+
+	assert.Equal(t, 2022, cfg.APIPort)
+	assert.Equal(t, 2023, cfg.Port)
+}
+
 func TestSetPort(t *testing.T) {
 	cfg := &Config{Port: 8080}
 	cfg.SetPort(9090)
