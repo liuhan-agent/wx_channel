@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -549,6 +550,7 @@ func mapSearchWork(item map[string]any, id, keyword string, rank, page, index in
 		ObjectNonceID:    optionalString(item, "objectNonceId"),
 		Author:           mapSearchAccount(item),
 		MediaType:        mapSearchMedia(item),
+		Engagement:       mapSearchEngagement(item),
 		CollectionStatus: "pending",
 		Locator: WorkLocator{
 			Keyword: keyword, SearchRank: rank, SearchPage: page, IndexInPage: index,
@@ -559,6 +561,132 @@ func mapSearchWork(item map[string]any, id, keyword string, rank, page, index in
 		work.Title = optionalString(description, "description")
 	}
 	return work
+}
+
+const engagementMappingVersion = "wechat_channels-v1"
+
+var engagementMetricFields = map[string][]string{
+	"like_count":             {"likeCount", "likeCountFmt"},
+	"platform_comment_count": {"commentCount", "commentCountFmt"},
+	"favorite_count":         {"favCount", "favCountFmt"},
+	"share_count":            {"forwardCount", "forwardCountFmt"},
+}
+
+func mapSearchEngagement(item map[string]any) *ContentEngagement {
+	metrics := make(map[string]ContentMetricObservation, len(engagementMetricFields))
+	for key, fields := range engagementMetricFields {
+		metrics[key] = mapSearchMetric(item, fields...)
+	}
+	return &ContentEngagement{
+		SchemaVersion:  1,
+		MappingVersion: engagementMappingVersion,
+		Metrics:        metrics,
+		Extensions:     map[string]ContentMetricObservation{},
+	}
+}
+
+func mapSearchMetric(item map[string]any, fields ...string) ContentMetricObservation {
+	observation := ContentMetricObservation{
+		Status:   ContentMetricSourceMissing,
+		RawField: fields[0],
+	}
+	var raw any
+	found := false
+	for _, source := range []map[string]any{item, engagementNestedFeedInfo(item)} {
+		if source == nil {
+			continue
+		}
+		for _, field := range fields {
+			value, ok := source[field]
+			if !ok {
+				continue
+			}
+			observation.RawField = field
+			raw = value
+			found = true
+			break
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		return observation
+	}
+	observation.RawValue = raw
+	value, ok := parseEngagementCount(raw)
+	if !ok {
+		observation.Status = ContentMetricSchemaUnrecognized
+		return observation
+	}
+	observation.Value = &value
+	observation.Status = ContentMetricAvailable
+	return observation
+}
+
+func engagementNestedFeedInfo(item map[string]any) map[string]any {
+	feedInfo, _ := item["feedInfo"].(map[string]any)
+	return feedInfo
+}
+
+func parseEngagementCount(raw any) (int64, bool) {
+	switch value := raw.(type) {
+	case int:
+		if value >= 0 {
+			return int64(value), true
+		}
+	case int64:
+		if value >= 0 {
+			return value, true
+		}
+	case json.Number:
+		return parseEngagementCountString(value.String())
+	case float64:
+		if value >= 0 && value <= math.MaxInt64 && value == math.Trunc(value) {
+			return int64(value), true
+		}
+	case string:
+		return parseEngagementCountString(value)
+	}
+	return 0, false
+}
+
+func parseEngagementCountString(raw string) (int64, bool) {
+	text := strings.TrimSpace(strings.ReplaceAll(raw, ",", ""))
+	if text == "" {
+		return 0, false
+	}
+	if value, err := strconv.ParseInt(text, 10, 64); err == nil && value >= 0 {
+		return value, true
+	}
+	unit := float64(1)
+	base := text
+	for suffix, multiplier := range map[string]float64{
+		"亿": 100_000_000,
+		"万": 10_000,
+		"b": 1_000_000_000,
+		"m": 1_000_000,
+		"k": 1_000,
+		"w": 10_000,
+	} {
+		if strings.HasSuffix(strings.ToLower(base), suffix) {
+			base = strings.TrimSpace(base[:len(base)-len(suffix)])
+			unit = multiplier
+			break
+		}
+	}
+	if base == text {
+		return 0, false
+	}
+	number, err := strconv.ParseFloat(base, 64)
+	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+		return 0, false
+	}
+	scaled := number * unit
+	if scaled > math.MaxInt64 || math.IsInf(scaled, 0) {
+		return 0, false
+	}
+	return int64(math.Round(scaled)), true
 }
 
 func mapSearchAccount(item map[string]any) PublicAccount {

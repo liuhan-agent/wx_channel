@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const BatchSchemaVersion = "wechat-channels-batch/3"
+const BatchSchemaVersion = "wechat-channels-batch/4"
 
 var defaultCommentMediaLimits = CommentMediaLimits{
 	PerComment: 4, PerBatch: 100, PerFileBytes: 8 << 20, Timeout: 10 * time.Second,
@@ -308,6 +308,7 @@ func runLtaooBatchWithMedia(
 	result.Counts = countBatchRecords(works, comments)
 	result.PageDiagnostics = pageDiagnostics
 	result.CompletedAt = time.Now().UTC()
+	stampWorkEngagement(works, result.CompletedAt)
 	clearEvidenceReferences(works, comments)
 	if err := writeJSONLines(filepath.Join(draftRoot, "contents.jsonl"), works); err != nil {
 		return BatchDraftResult{}, err
@@ -325,6 +326,15 @@ func runLtaooBatchWithMedia(
 		return BatchDraftResult{}, err
 	}
 	return result, nil
+}
+
+func stampWorkEngagement(works []Work, observedAt time.Time) {
+	stamp := observedAt.UTC().Format(time.RFC3339Nano)
+	for index := range works {
+		if works[index].Engagement != nil {
+			works[index].Engagement.ObservedAt = stamp
+		}
+	}
 }
 
 func FinalizeLtaooBatch(request BatchRequest, runRoot, cleanupReceiptPath string) (BatchManifest, error) {

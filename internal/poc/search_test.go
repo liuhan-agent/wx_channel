@@ -139,6 +139,43 @@ func TestMapSearchAccountCarriesOnlyReturnedProfileURL(t *testing.T) {
 	}
 }
 
+func TestMapSearchWorkExtractsEngagementMetricsAndStatuses(t *testing.T) {
+	work := mapSearchWork(map[string]any{
+		"likeCount":    "1.2万",
+		"commentCount": "17",
+		"feedInfo": map[string]any{
+			"favCountFmt":     "3.5k",
+			"forwardCountFmt": "not-a-count",
+		},
+	}, "work-id", "主题", 1, 1, 1, SourceRef{})
+	if work.Engagement == nil {
+		t.Fatal("engagement envelope is nil")
+	}
+	metrics := work.Engagement.Metrics
+	if metrics["like_count"].Status != ContentMetricAvailable ||
+		metrics["like_count"].Value == nil || *metrics["like_count"].Value != 12000 {
+		t.Fatalf("like metric=%+v", metrics["like_count"])
+	}
+	if metrics["platform_comment_count"].Status != ContentMetricAvailable ||
+		metrics["platform_comment_count"].Value == nil || *metrics["platform_comment_count"].Value != 17 {
+		t.Fatalf("comment metric=%+v", metrics["platform_comment_count"])
+	}
+	if metrics["favorite_count"].Status != ContentMetricAvailable ||
+		metrics["favorite_count"].Value == nil || *metrics["favorite_count"].Value != 3500 {
+		t.Fatalf("favorite metric=%+v", metrics["favorite_count"])
+	}
+	if metrics["share_count"].Status != ContentMetricSchemaUnrecognized ||
+		metrics["share_count"].Value != nil {
+		t.Fatalf("share metric=%+v", metrics["share_count"])
+	}
+	missing := mapSearchWork(map[string]any{}, "work-id-2", "主题", 2, 1, 2, SourceRef{}).Engagement.Metrics
+	for key, metric := range missing {
+		if metric.Status != ContentMetricSourceMissing || metric.Value != nil {
+			t.Fatalf("missing metric %s=%+v", key, metric)
+		}
+	}
+}
+
 type fixtureClock struct{ now time.Time }
 
 func (c *fixtureClock) Now() time.Time { return c.now }

@@ -248,7 +248,7 @@ func TestRunAndFinalizeLtaooBatchPublishesVerifiedMediaAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.SchemaVersion != "wechat-channels-batch/3" || manifest.Status != BatchSucceeded {
+	if manifest.SchemaVersion != "wechat-channels-batch/4" || manifest.Status != BatchSucceeded {
 		t.Fatalf("manifest=%+v", manifest)
 	}
 	issueRaw, err := os.ReadFile(filepath.Join(runRoot, "batch", "issues.jsonl"))

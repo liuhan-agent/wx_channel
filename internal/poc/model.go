@@ -69,6 +69,29 @@ type MediaType struct {
 	Normalized string `json:"normalized"`
 }
 
+type ContentMetricStatus string
+
+const (
+	ContentMetricAvailable          ContentMetricStatus = "available"
+	ContentMetricSourceMissing      ContentMetricStatus = "source_missing"
+	ContentMetricSchemaUnrecognized ContentMetricStatus = "schema_unrecognized"
+)
+
+type ContentMetricObservation struct {
+	Value    *int64              `json:"value"`
+	Status   ContentMetricStatus `json:"status"`
+	RawField string              `json:"raw_field"`
+	RawValue any                 `json:"raw_value"`
+}
+
+type ContentEngagement struct {
+	SchemaVersion  int                                 `json:"schema_version"`
+	MappingVersion string                              `json:"mapping_version"`
+	ObservedAt     string                              `json:"observed_at"`
+	Metrics        map[string]ContentMetricObservation `json:"metrics"`
+	Extensions     map[string]ContentMetricObservation `json:"extensions"`
+}
+
 type SourceRef struct {
 	Method      string `json:"method"`
 	EvidenceRef string `json:"evidence_ref"`
@@ -91,15 +114,16 @@ type PublicAccount struct {
 }
 
 type Work struct {
-	WorkID               *string       `json:"work_id"`
-	ObjectNonceID        *string       `json:"object_nonce_id"`
-	Title                *string       `json:"title"`
-	Author               PublicAccount `json:"author"`
-	MediaType            MediaType     `json:"media_type"`
-	Locator              WorkLocator   `json:"locator"`
-	CollectionStatus     string        `json:"collection_status"`
-	TopLevelCommentCount int           `json:"top_level_comment_count"`
-	ReplyCount           int           `json:"reply_count"`
+	WorkID               *string            `json:"work_id"`
+	ObjectNonceID        *string            `json:"object_nonce_id"`
+	Title                *string            `json:"title"`
+	Author               PublicAccount      `json:"author"`
+	MediaType            MediaType          `json:"media_type"`
+	Engagement           *ContentEngagement `json:"engagement"`
+	Locator              WorkLocator        `json:"locator"`
+	CollectionStatus     string             `json:"collection_status"`
+	TopLevelCommentCount int                `json:"top_level_comment_count"`
+	ReplyCount           int                `json:"reply_count"`
 	Truncation           struct {
 		Truncated bool     `json:"truncated"`
 		Reasons   []string `json:"reasons"`
