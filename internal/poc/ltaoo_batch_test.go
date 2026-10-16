@@ -251,6 +251,10 @@ func TestRunAndFinalizeLtaooBatchPublishesVerifiedMediaAssets(t *testing.T) {
 	if manifest.SchemaVersion != "wechat-channels-batch/3" || manifest.Status != BatchSucceeded {
 		t.Fatalf("manifest=%+v", manifest)
 	}
+	issueRaw, err := os.ReadFile(filepath.Join(runRoot, "batch", "issues.jsonl"))
+	if err != nil || strings.Contains(string(issueRaw), `"stage":"media"`) {
+		t.Fatalf("verified media must not produce a media issue: issues=%s err=%v", issueRaw, err)
+	}
 	assetRaw, err := os.ReadFile(filepath.Join(runRoot, "batch", "media-assets.jsonl"))
 	if err != nil {
 		t.Fatal(err)
@@ -275,6 +279,41 @@ func TestRunAndFinalizeLtaooBatchPublishesVerifiedMediaAssets(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runRoot, "batch", "media", ".tmp")); !os.IsNotExist(err) {
 		t.Fatalf("temporary media directory was published: %v", err)
+	}
+}
+
+func TestRunLtaooBatchMissingMediaCandidateIsNotSilent(t *testing.T) {
+	for _, comment := range []string{
+		`{"commentId":"batch-root-1","content":"text plus image","contentType":2}`,
+		`{"commentId":"batch-root-1","contentInfo":{"imageInfos":[{}]}}`,
+		`{"commentId":"batch-root-1","contentInfo":{"emoticonInfos":["invalid"]}}`,
+	} {
+		t.Run(comment, func(t *testing.T) {
+			server := newBatchFixtureServerWithComment(t, "", comment)
+			defer server.Close()
+			runRoot := t.TempDir()
+			requestPath := filepath.Join(runRoot, "request.json")
+			writeBatchRequestFixture(t, requestPath, runRoot, nil)
+			request, err := LoadBatchRequest(requestPath, runRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := NewLtaooClient(server.URL, 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := RunLtaooBatch(context.Background(), request, client, runRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != BatchSucceeded || result.Counts.TopLevelComments != 1 || result.Targets[0].Status != "completed" {
+				t.Fatalf("result=%+v", result)
+			}
+			issues, err := os.ReadFile(filepath.Join(runRoot, "batch.partial-"+request.RunID, "issues.jsonl"))
+			if err != nil || !strings.Contains(string(issues), `"stage":"media","code":"media_unavailable","work_id":"batch-work-1"`) {
+				t.Fatalf("missing media must produce an issue: issues=%s err=%v", issues, err)
+			}
+		})
 	}
 }
 

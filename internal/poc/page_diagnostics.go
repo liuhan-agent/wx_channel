@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // PageDiagnostic records response shape only. It deliberately excludes field
@@ -33,6 +35,7 @@ type PageDiagnostic struct {
 	CommentInfoPresent          bool           `json:"comment_info_present,omitempty"`
 	CommentInfoType             string         `json:"comment_info_type,omitempty"`
 	CommentInfoCount            int            `json:"comment_info_count,omitempty"`
+	CommentMediaShapeCounts     map[string]int `json:"comment_media_shape_counts,omitempty"`
 	LastBufferPresent           bool           `json:"last_buffer_present"`
 	LastBufferType              string         `json:"last_buffer_type,omitempty"`
 	LastBufferLength            int            `json:"last_buffer_length,omitempty"`
@@ -124,6 +127,17 @@ func summarizePageResponse(method string, raw []byte) PageDiagnostic {
 	}
 	if value, exists := container["commentInfo"]; exists {
 		setList(value, &diagnostic.CommentInfoPresent, &diagnostic.CommentInfoType, &diagnostic.CommentInfoCount)
+		if items, ok := value.([]any); ok {
+			diagnostic.CommentMediaShapeCounts = make(map[string]int)
+			for _, value := range items {
+				if item, ok := value.(map[string]any); ok {
+					summarizeCommentMediaShape(item, diagnostic.CommentMediaShapeCounts)
+					for _, reply := range childComments(item) {
+						summarizeCommentMediaShape(reply, diagnostic.CommentMediaShapeCounts)
+					}
+				}
+			}
+		}
 	}
 	if value, exists := container["lastBuffer"]; exists {
 		diagnostic.LastBufferPresent = true
@@ -159,6 +173,77 @@ func summarizePageResponse(method string, raw []byte) PageDiagnostic {
 		}
 	}
 	return diagnostic
+}
+
+// Keep keys in this diagnostic finite: never copy descriptor names or values.
+// Both observed PascalCase fields and possible camelCase variants are counted;
+// counting a variant does not make it an accepted download descriptor.
+func summarizeCommentMediaShape(item map[string]any, counts map[string]int) {
+	code := "missing"
+	if value, present := item["contentType"]; present {
+		code = "other"
+		switch fmt.Sprint(value) {
+		case "1":
+			code = "1"
+		case "2":
+			code = "2"
+		}
+	}
+	counts["contentType:"+code]++
+	value, present := item["contentInfo"]
+	if !present {
+		counts["contentInfo:missing"]++
+		return
+	}
+	counts["contentInfo:"+jsonType(value)]++
+	info, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	for _, group := range []string{"imageInfos", "emoticonInfos"} {
+		path := "contentInfo." + group
+		value, present := info[group]
+		if !present {
+			counts[path+":missing"]++
+			continue
+		}
+		counts[path+":"+jsonType(value)]++
+		values, ok := value.([]any)
+		if !ok {
+			continue
+		}
+		counts[path+":items"] += len(values)
+		if len(values) == 0 {
+			counts[path+":empty"]++
+		}
+		for _, value := range values {
+			counts[path+"[]:"+jsonType(value)]++
+			descriptor, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			knownFields := 0
+			for _, key := range []string{"Url", "url", "EncryptUrl", "encryptUrl", "AesKey", "aesKey"} {
+				state := "missing"
+				if field, present := descriptor[key]; present {
+					knownFields++
+					switch typed := field.(type) {
+					case nil:
+						state = "null"
+					case string:
+						state = "string"
+						if strings.TrimSpace(typed) == "" {
+							state = "empty"
+						}
+					default:
+						state = "invalid"
+					}
+				}
+				counts[path+"[]."+key+":"+state]++
+			}
+			counts[path+"[]:other_fields"] += len(descriptor) - knownFields
+		}
+	}
 }
 
 func safeMediaTypeCode(value any) string {

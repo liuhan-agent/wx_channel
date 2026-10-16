@@ -259,7 +259,9 @@ func runLtaooBatchWithMedia(
 		collected, summary, collectErr := collector.CollectComments(ctx, Options{Limits: request.Limits}, works[index])
 		comments = append(comments, collected...)
 		pageDiagnostics = append(pageDiagnostics, collector.drainPageDiagnostics()...)
-		for _, candidate := range collector.drainCommentMediaCandidates() {
+		candidates := collector.drainCommentMediaCandidates()
+		issues = append(issues, missingCommentMediaIssues(collected, candidates, dereferenceString(works[index].WorkID))...)
+		for _, candidate := range candidates {
 			asset, issue := mediaResolver.ResolveContext(ctx, candidate)
 			if issue != nil {
 				issues = append(issues, Issue{

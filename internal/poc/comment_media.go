@@ -49,6 +49,32 @@ type commentMediaResolutionIssue struct {
 	code string
 }
 
+// A legacy type marker or an unusable descriptor can identify media without
+// producing a candidate. Report that gap just like a failed resolution, while
+// preserving the collected comment and the content-collection status.
+func missingCommentMediaIssues(comments []Comment, candidates []commentMediaCandidate, workID string) []Issue {
+	type mediaIdentity struct{ ref, mediaType string }
+	covered := make(map[mediaIdentity]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		covered[mediaIdentity{candidate.commentRef, candidate.mediaType}] = struct{}{}
+	}
+	var issues []Issue
+	for _, comment := range comments {
+		for _, mediaType := range comment.Content.MediaTypes {
+			if mediaType != "image" && mediaType != "sticker" {
+				continue
+			}
+			key := mediaIdentity{comment.Content.MediaRef, mediaType}
+			if _, ok := covered[key]; ok {
+				continue
+			}
+			covered[key] = struct{}{}
+			issues = append(issues, Issue{Stage: "media", Code: "media_unavailable", WorkID: workID})
+		}
+	}
+	return issues
+}
+
 type commentMediaResolver struct {
 	client          *http.Client
 	mediaRoot       string
