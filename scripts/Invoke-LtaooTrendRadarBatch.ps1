@@ -71,14 +71,20 @@ function Test-LtaooExecutableContract {
         # silently turns a video search into an account search and is exactly
         # how a ten-work request collapsed to three account-feed works. Verify
         # the embedded page bridge carries the video scene and cursor contract
-        # before allowing the process to start.
+        # before allowing the process to start. The bridge must also leave
+        # author profile URLs untouched: finderUsername/username is an
+        # internal identifier, not a public share URL. Older local builds
+        # recursively manufactured channels.weixin.qq.com profile routes;
+        # those routes open an error/update page and must fail closed.
         $embedded = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($ExecutablePath))
-        foreach ($marker in @(
-            'key:channels:contact_list',
-            'searchType === 3 ? 19 : 13',
-            'lastBuff: data.next_marker'
-        )) {
+        foreach ($marker in @('key:channels:contact_list', 'lastBuff')) {
             if (-not $embedded.Contains($marker)) { throw 'ltaoo_search_scene_contract_invalid' }
+        }
+        if (-not ($embedded.Contains('searchType === 3 ? 19 : 13') -or $embedded.Contains('searchType===3?19:13'))) {
+            throw 'ltaoo_search_scene_contract_invalid'
+        }
+        foreach ($forbiddenMarker in @('profileURLForUsername', 'addProfileURLs')) {
+            if ($embedded.Contains($forbiddenMarker)) { throw 'ltaoo_profile_url_contract_invalid' }
         }
     } catch [System.Management.Automation.RuntimeException] {
         throw

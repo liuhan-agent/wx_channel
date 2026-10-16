@@ -21,6 +21,25 @@ func TestSafeURLRejectsCredentialsAndNonHTTP(t *testing.T) {
 	}
 }
 
+func TestSafeProfileURLKeepsOnlyRealChannelsProfileURLs(t *testing.T) {
+	generated := "https://channels.weixin.qq.com/web/pages/profile?finderUsername=v2_author%40finder"
+	got, status := SafeProfileURL(generated)
+	if got == nil || *got != generated || status != FieldPresent {
+		t.Fatalf("got=%v status=%s", got, status)
+	}
+	for _, raw := range []string{
+		"https://channels.weixin.qq.com/web/pages/profile",
+		"http://channels.weixin.qq.com/web/pages/profile?username=author",
+		"https://channels.weixin.qq.com/web/pages/home?finderUsername=v2_author@finder",
+		"https://channels.weixin.qq.com/web/pages/profile?token=secret",
+		"https://example.test/web/pages/profile?finderUsername=author",
+	} {
+		if got, status := SafeProfileURL(raw); got != nil || status != FieldRedactedForSafety {
+			t.Fatalf("SafeProfileURL(%q)=(%v,%s)", raw, got, status)
+		}
+	}
+}
+
 func TestScanOutputRejectsCredentials(t *testing.T) {
 	cases := [][]byte{
 		[]byte(`{"authorization":"Bearer abc"}`),
@@ -36,6 +55,9 @@ func TestScanOutputRejectsCredentials(t *testing.T) {
 		if err := ScanOrdinaryOutput(raw); err == nil {
 			t.Fatalf("accepted secret: %q", raw)
 		}
+	}
+	if err := ScanOrdinaryOutput([]byte(`{"profile_url":"https://channels.weixin.qq.com/web/pages/profile?finderUsername=author"}`)); err != nil {
+		t.Fatalf("approved profile URL rejected: %v", err)
 	}
 }
 

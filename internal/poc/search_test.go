@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,8 +51,8 @@ func TestCollectVideoKeywordSearchesAccountsAndExpandsOnlyVideos(t *testing.T) {
 		"finderSearch": {[]byte(`{"data":{"objectList":[
 			{"id":"live-result","objectNonceId":"live-nonce","objectDesc":{"mediaType":9}}
 		],"infoList":[
-			{"contact":{"username":"finder-alice","nickname":"Alice"}},
-			{"contact":{"username":"finder-bob","nickname":"Bob"}}
+			{"contact":{"username":"finder-alice","nickname":"Alice","profileUrl":"https://channels.weixin.qq.com/web/pages/profile?finderUsername=finder-alice"}},
+			{"contact":{"username":"finder-bob","nickname":"Bob","profileUrl":"https://channels.weixin.qq.com/web/pages/profile?finderUsername=finder-bob"}}
 		],"lastBuffer":""}}`)},
 		"finderUserPage": {
 			[]byte(`{"data":{"object":[
@@ -91,6 +92,9 @@ func TestCollectVideoKeywordSearchesAccountsAndExpandsOnlyVideos(t *testing.T) {
 		if work.MediaType.Normalized != "video" {
 			t.Fatalf("non-video work collected: %+v", work)
 		}
+		if work.Author.ProfileURL == nil || !strings.HasPrefix(*work.Author.ProfileURL, "https://channels.weixin.qq.com/web/pages/profile?finderUsername=") {
+			t.Fatalf("author profile URL not preserved: %+v", work.Author)
+		}
 	}
 }
 
@@ -109,6 +113,29 @@ func TestMapSearchMediaSeparatesPicturesFromVideos(t *testing.T) {
 				t.Fatalf("media type %q normalized to %q, want %q", test.code, work.MediaType.Normalized, test.want)
 			}
 		})
+	}
+}
+
+func TestMapSearchAccountCarriesOnlyReturnedProfileURL(t *testing.T) {
+	work := mapSearchWork(map[string]any{
+		"contact": map[string]any{
+			"username":   "author-id",
+			"nickname":   "作者",
+			"profileUrl": "https://channels.weixin.qq.com/web/pages/profile?finderUsername=author-id",
+		},
+	}, "work-id", "主题", 1, 1, 1, SourceRef{})
+	if work.Author.ProfileURL == nil || *work.Author.ProfileURL != "https://channels.weixin.qq.com/web/pages/profile?finderUsername=author-id" {
+		t.Fatalf("profile URL=%v", work.Author.ProfileURL)
+	}
+
+	withoutProfile := mapSearchWork(map[string]any{
+		"contact": map[string]any{
+			"username": "author-id",
+			"nickname": "作者",
+		},
+	}, "work-id-2", "主题", 2, 1, 2, SourceRef{})
+	if withoutProfile.Author.ProfileURL != nil {
+		t.Fatalf("profile URL guessed from account ID: %v", withoutProfile.Author.ProfileURL)
 	}
 }
 

@@ -121,6 +121,67 @@ async function main() {
   assertEqual(configuredPortEnv.api.getWebSocketPorts()[0], 2022, 'runtime api port should be tried first');
   assert(configuredPortEnv.api.getWebSocketPorts().includes(2026), 'legacy api port should remain a fallback');
 
+  const profileSearchResponses = [];
+  const profileSearchEnv = loadAPIClientModule({
+    window: {
+      WXU: {
+        API: {},
+        API2: {
+          async finderSearch(payload) {
+            assertEqual(payload.scene, 19, 'video search should keep the video scene');
+            return {
+              errCode: 0,
+              data: {
+                objectList: [{contact: {username: 'fixture-author@finder', nickname: 'Fixture Author'}}],
+              },
+            };
+          },
+        },
+      },
+    },
+  });
+  profileSearchEnv.api.connected = true;
+  profileSearchEnv.api.ws = {send(raw) { profileSearchResponses.push(JSON.parse(raw)); }};
+  await profileSearchEnv.api.handleAPICall({
+    id: 'case-author-profile',
+    key: 'key:channels:contact_list',
+    body: {keyword: 'fixture', type: 3},
+  });
+  assertEqual(
+    profileSearchResponses[0].data.data.data.objectList[0].contact.profileUrl,
+    undefined,
+    'finderSearch must not infer a public profile URL from an internal username',
+  );
+
+  const profileCommentResponses = [];
+  const profileCommentEnv = loadAPIClientModule({
+    window: {
+      WXU: {
+        API: {
+          async finderGetCommentList() {
+            return {
+              errCode: 0,
+              data: {comments: [{username: 'fixture-commenter@finder', nickname: 'Fixture Commenter'}]},
+            };
+          },
+        },
+        API2: {},
+      },
+    },
+  });
+  profileCommentEnv.api.connected = true;
+  profileCommentEnv.api.ws = {send(raw) { profileCommentResponses.push(JSON.parse(raw)); }};
+  await profileCommentEnv.api.handleAPICall({
+    id: 'case-comment-profile',
+    key: 'key:channels:fetch_feed_comment_list',
+    body: {object_id: 'fixture-object', nonce_id: 'fixture-nonce'},
+  });
+  assertEqual(
+    profileCommentResponses[0].data.data.data.comments[0].profileUrl,
+    undefined,
+    'comment response must not infer a public profile URL from an internal username',
+  );
+
   const shareEnv = loadAPIClientModule();
   const sharePayload = await shareEnv.api.buildFeedProfilePayload({
     url: 'https://weixin.qq.com/sph/A1b2C3d4',

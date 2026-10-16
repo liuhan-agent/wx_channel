@@ -49,6 +49,26 @@ func TestCollectCommentsMapsTopLevelAndReplies(t *testing.T) {
 	}
 }
 
+func TestMapCommentCarriesReturnedProfileURLWithoutGuessing(t *testing.T) {
+	workID := "fixture-profile-work"
+	comment, _, _ := mapComment(map[string]any{
+		"username":   "author-id",
+		"nickname":   "作者",
+		"profileUrl": "https://channels.weixin.qq.com/web/pages/profile?username=author-id",
+	}, 1, &workID, nil, SourceRef{})
+	if comment.Account.ProfileURL == nil || *comment.Account.ProfileURL != "https://channels.weixin.qq.com/web/pages/profile?username=author-id" {
+		t.Fatalf("profile URL=%v", comment.Account.ProfileURL)
+	}
+
+	withoutProfile, _, _ := mapComment(map[string]any{
+		"username": "author-id",
+		"nickname": "作者",
+	}, 1, &workID, nil, SourceRef{})
+	if withoutProfile.Account.ProfileURL != nil {
+		t.Fatalf("profile URL guessed from account ID: %v", withoutProfile.Account.ProfileURL)
+	}
+}
+
 func TestTopLevelRepeatedMarkerWithNoNewComments(t *testing.T) {
 	root := map[string]any{"commentId": "fixture-repeat-root", "content": "fixture-root"}
 	api := &fixturePageAPI{responses: [][]byte{

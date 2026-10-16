@@ -33,17 +33,56 @@ func SafeURL(raw string) (*string, FieldStatus) {
 	return &safe, FieldPresent
 }
 
+// SafeProfileURL keeps a real WeChat Channels profile URL when the page bridge
+// returns one.  The collector must not manufacture a profile URL from an
+// internal username because that identifier is not itself a public link.
+func SafeProfileURL(raw string) (*string, FieldStatus) {
+	if raw == "" {
+		return nil, FieldMissingInSource
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || !isSafeProfileURL(parsed) {
+		return nil, FieldRedactedForSafety
+	}
+	safe := parsed.String()
+	return &safe, FieldPresent
+}
+
+func isSafeProfileURL(parsed *url.URL) bool {
+	if parsed == nil || parsed.Scheme != "https" ||
+		parsed.Hostname() != "channels.weixin.qq.com" || parsed.Port() != "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.Path != "/web/pages/profile" {
+		return false
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil || len(query) != 1 {
+		return false
+	}
+	for key, values := range query {
+		if key != "finderUsername" && key != "username" {
+			return false
+		}
+		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+			return false
+		}
+	}
+	return true
+}
+
 func ScanOrdinaryOutput(raw []byte) error {
 	switch {
 	case pemPrivateKeyPattern.Match(raw):
 		return errors.New("ordinary output contains a private-key marker")
 	case credentialPattern.Match(raw):
 		return errors.New("ordinary output contains a credential marker")
-	case queryURLPattern.Match(raw):
-		return errors.New("ordinary output contains a URL query")
-	default:
-		return nil
 	}
+	for _, match := range queryURLPattern.FindAll(raw, -1) {
+		parsed, err := url.Parse(string(match))
+		if err != nil || !isSafeProfileURL(parsed) {
+			return errors.New("ordinary output contains a URL query")
+		}
+	}
+	return nil
 }
 
 func RedactString(raw string) (*string, FieldStatus) {
@@ -58,9 +97,16 @@ func RedactString(raw string) (*string, FieldStatus) {
 }
 
 func countRedactions(raw []byte) RedactionCounts {
+	queryURLs := 0
+	for _, match := range queryURLPattern.FindAll(raw, -1) {
+		parsed, err := url.Parse(string(match))
+		if err != nil || !isSafeProfileURL(parsed) {
+			queryURLs++
+		}
+	}
 	return RedactionCounts{
 		CredentialKeys: len(credentialPattern.FindAll(raw, -1)),
-		QueryURLs:      len(queryURLPattern.FindAll(raw, -1)),
+		QueryURLs:      queryURLs,
 		PEMMarkers:     len(pemPrivateKeyPattern.FindAll(raw, -1)),
 	}
 }

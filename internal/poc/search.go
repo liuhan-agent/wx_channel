@@ -563,9 +563,11 @@ func mapSearchWork(item map[string]any, id, keyword string, rank, page, index in
 
 func mapSearchAccount(item map[string]any) PublicAccount {
 	account := PublicAccount{}
+	contact := item
 	if contact, ok := item["contact"].(map[string]any); ok {
 		account.AccountID = optionalString(contact, "username")
 		account.DisplayName = optionalString(contact, "nickname")
+		account.ProfileURL = optionalProfileURL(contact)
 	}
 	if account.AccountID == nil {
 		account.AccountID = optionalString(item, "username")
@@ -573,7 +575,30 @@ func mapSearchAccount(item map[string]any) PublicAccount {
 	if account.DisplayName == nil {
 		account.DisplayName = optionalString(item, "nickname")
 	}
+	if account.ProfileURL == nil {
+		account.ProfileURL = optionalProfileURL(contact)
+	}
 	return account
+}
+
+func optionalProfileURL(object map[string]any) *string {
+	for _, key := range []string{"profile_url", "profileUrl", "home_url", "homeUrl"} {
+		if raw, ok := stringField(object, key); ok {
+			if safe, status := SafeProfileURL(raw); status == FieldPresent {
+				return safe
+			}
+		}
+	}
+	if nested, ok := object["profile"].(map[string]any); ok {
+		for _, key := range []string{"url", "profile_url", "profileUrl"} {
+			if raw, ok := stringField(nested, key); ok {
+				if safe, status := SafeProfileURL(raw); status == FieldPresent {
+					return safe
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func mapSearchMedia(item map[string]any) MediaType {

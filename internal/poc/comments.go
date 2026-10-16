@@ -424,6 +424,7 @@ func mapComment(item map[string]any, level int, workID *string, retrievalRoot *s
 	}
 	comment.Account.AccountID = optionalString(item, "username")
 	comment.Account.DisplayName = optionalString(item, "nickname")
+	comment.Account.ProfileURL = optionalProfileURL(item)
 	avatarStatus := FieldMissingInSource
 	if avatar, present := stringField(item, "headUrl"); present {
 		comment.Account.AvatarURL, avatarStatus = SafeURL(avatar)

@@ -32,7 +32,7 @@ func TestDatasetSerializesMissingSourceFieldsAsNull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"comment_id":null`, `"parent_comment_id":null`, `"text":null`, `"account_id":null`} {
+	for _, want := range []string{`"comment_id":null`, `"parent_comment_id":null`, `"text":null`, `"account_id":null`, `"profile_url":null`} {
 		if !bytes.Contains(raw, []byte(want)) {
 			t.Errorf("missing %s in %s", want, raw)
 		}

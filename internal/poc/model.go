@@ -87,6 +87,7 @@ type PublicAccount struct {
 	AccountID   *string `json:"account_id"`
 	DisplayName *string `json:"display_name"`
 	AvatarURL   *string `json:"avatar_url"`
+	ProfileURL  *string `json:"profile_url"`
 }
 
 type Work struct {
