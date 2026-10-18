@@ -9,6 +9,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -75,6 +76,45 @@ func TestMapCommentContentInfoMediaPrecedence(t *testing.T) {
 			},
 			wantTypes:      []string{"image"},
 			wantCandidates: []string{"image"},
+		},
+		{
+			name: "lowercase direct image URL",
+			item: map[string]any{
+				"commentId": "lowercase-image", "contentType": 2,
+				"contentInfo": map[string]any{"imageInfos": []any{
+					map[string]any{"url": "https://media.example.test/image.png"},
+				}},
+			},
+			wantTypes:      []string{"image"},
+			wantCandidates: []string{"image"},
+		},
+		{
+			name: "URL aliases remain one candidate",
+			item: map[string]any{
+				"commentId": "both-url-aliases", "contentType": 2,
+				"contentInfo": map[string]any{"imageInfos": []any{
+					map[string]any{
+						"Url": "https://media.example.test/upper.png",
+						"url": "https://media.example.test/lower.png",
+					},
+				}},
+			},
+			wantTypes:      []string{"image"},
+			wantCandidates: []string{"image"},
+		},
+		{
+			name: "lowercase encrypted sticker remains unresolved",
+			item: map[string]any{
+				"commentId": "lowercase-encrypted", "contentType": 1,
+				"contentInfo": map[string]any{"emoticonInfos": []any{
+					map[string]any{
+						"encryptUrl": "https://media.example.test/encrypted",
+						"aesKey":     "key-material",
+					},
+				}},
+			},
+			wantTypes:      []string{"sticker"},
+			wantCandidates: []string{"sticker"},
 		},
 		{
 			name: "sticker overrides text content type",
@@ -145,6 +185,25 @@ func TestMapCommentContentInfoMediaPrecedence(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotCandidates, test.wantCandidates) {
 				t.Fatalf("candidate types=%v want=%v", gotCandidates, test.wantCandidates)
+			}
+			if test.name == "URL aliases remain one candidate" {
+				if len(candidates) != 1 || candidates[0].directURL != "https://media.example.test/upper.png" {
+					t.Fatalf("URL alias candidate=%+v", candidates)
+				}
+			}
+			if test.name == "lowercase encrypted sticker remains unresolved" {
+				if len(candidates) != 1 || candidates[0].cipherURL == "" || candidates[0].aesKey == "" || candidates[0].directURL != "" {
+					t.Fatalf("encrypted candidate=%+v", candidates)
+				}
+				resolver := newCommentMediaResolver(
+					&http.Client{}, filepath.Join(t.TempDir(), "media"),
+					CommentMediaLimits{PerComment: 4, PerBatch: 100, PerFileBytes: 1 << 20, Timeout: time.Second},
+					map[string]struct{}{"media.example.test": {}},
+				)
+				asset, issue := resolver.Resolve(candidates[0])
+				if issue == nil || issue.code != "media_unavailable" || asset.RelativePath != "" {
+					t.Fatalf("encrypted resolution asset=%+v issue=%+v", asset, issue)
+				}
 			}
 			raw, err := json.Marshal(comment)
 			if err != nil {
@@ -231,6 +290,123 @@ func TestCommentMediaResolverDownloadsValidatedImages(t *testing.T) {
 	}
 }
 
+func TestCommentMediaResolverDownloadsWeChatHTTPImageOverHTTPS(t *testing.T) {
+	for _, host := range []string{"wxapp.tc.qq.com", "wxapp.tc.qq.com:80"} {
+		t.Run(host, func(t *testing.T) {
+			payload := testImageBytes(t, "png")
+			requests := 0
+			client := &http.Client{Transport: commentMediaTestTransport(func(request *http.Request) (*http.Response, error) {
+				requests++
+				if request.URL.String() != "https://wxapp.tc.qq.com/asset%2Fimage?token=private&size=0" {
+					t.Fatalf("unexpected request URL: %s", request.URL)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK, ContentLength: int64(len(payload)),
+					Header: http.Header{"Content-Type": {"image/png"}},
+					Body:   io.NopCloser(bytes.NewReader(payload)),
+				}, nil
+			})}
+			workID := "work-1"
+			_, candidates, _ := mapComment(map[string]any{
+				"commentId": "wx-http-image", "contentType": 2,
+				"contentInfo": map[string]any{"imageInfos": []any{map[string]any{
+					"url": "http://" + host + "/asset%2Fimage?token=private&size=0",
+				}}},
+			}, 1, &workID, nil, SourceRef{Method: commentListMethod, Ordinal: 1})
+			if len(candidates) != 1 {
+				t.Fatalf("candidates=%d", len(candidates))
+			}
+			mediaRoot := filepath.Join(t.TempDir(), "media")
+			resolver := newCommentMediaResolver(client, mediaRoot, defaultCommentMediaLimits, nil)
+			asset, issue := resolver.Resolve(candidates[0])
+			if issue != nil || requests != 1 {
+				t.Fatalf("issue=%+v requests=%d", issue, requests)
+			}
+			stored, err := os.ReadFile(filepath.Join(filepath.Dir(mediaRoot), filepath.FromSlash(asset.RelativePath)))
+			if err != nil || !bytes.Equal(stored, payload) {
+				t.Fatalf("stored image mismatch: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommentMediaResolverDownloadsImageWithSeparateToken(t *testing.T) {
+	for _, test := range []struct{ name, prefix, format, declared string }{
+		{"ampersand", "&", "png", "image/png"},
+		{"question", "?", "png", "image/png"},
+		{"no prefix", "", "png", "image/png"},
+		{"WeChat JPEG alias", "&", "jpeg", "image/jpg"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := testImageBytes(t, test.format)
+			const signedQuery = "encfilekey=key%2Fopaque+value&idx=1&token=signature+value%2B%26%3D&sign=a%252Fb"
+			requests := 0
+			client := &http.Client{Transport: commentMediaTestTransport(func(request *http.Request) (*http.Response, error) {
+				requests++
+				if request.URL.Scheme != "https" || request.URL.Host != "wxapp.tc.qq.com" || request.URL.RawQuery != signedQuery {
+					return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK, ContentLength: int64(len(payload)),
+					Header: http.Header{"Content-Type": {test.declared}},
+					Body:   io.NopCloser(bytes.NewReader(payload)),
+				}, nil
+			})}
+			workID := "work-1"
+			comment, candidates, _ := mapComment(map[string]any{
+				"commentId": "signed-image", "contentType": 2,
+				"contentInfo": map[string]any{"imageInfos": []any{map[string]any{
+					"url":   "http://wxapp.tc.qq.com/asset%2Fimage?encfilekey=key%2Fopaque+value&idx=1",
+					"token": test.prefix + "token=signature+value%2B%26%3D&sign=a%252Fb",
+				}}},
+			}, 1, &workID, nil, SourceRef{Method: commentListMethod, Ordinal: 1})
+			if len(candidates) != 1 {
+				t.Fatalf("candidates=%d", len(candidates))
+			}
+			mediaRoot := filepath.Join(t.TempDir(), "media")
+			resolver := newCommentMediaResolver(client, mediaRoot, defaultCommentMediaLimits, nil)
+			asset, issue := resolver.Resolve(candidates[0])
+			if issue != nil || requests != 1 {
+				t.Fatalf("separate image token was not used intact: issue=%+v requests=%d", issue, requests)
+			}
+			if test.format == "jpeg" && asset.MIMEType != "image/jpeg" {
+				t.Fatalf("noncanonical JPEG MIME type: %s", asset.MIMEType)
+			}
+			stored, err := os.ReadFile(filepath.Join(filepath.Dir(mediaRoot), filepath.FromSlash(asset.RelativePath)))
+			if err != nil || !bytes.Equal(stored, payload) {
+				t.Fatalf("stored image mismatch: %v", err)
+			}
+			for _, value := range []any{comment, asset} {
+				raw, err := json.Marshal(value)
+				if err != nil || strings.Contains(string(raw), "signature") || strings.Contains(string(raw), "encfilekey") {
+					t.Fatalf("image credentials leaked: %s (%v)", raw, err)
+				}
+			}
+		})
+	}
+}
+
+type commentMediaTestTransport func(*http.Request) (*http.Response, error)
+
+func (transport commentMediaTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestCommentMediaURLRejectsUnsafeHTTPSUpgrade(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://wxapp.tc.qq.com:8080/asset",
+		"http://wxapp.tc.qq.com.evil.test/asset",
+		"http://mmbiz.qpic.cn/asset",
+		"http://user:password@wxapp.tc.qq.com/asset",
+		"http://wxapp.tc.qq.com/asset#fragment",
+		"ftp://wxapp.tc.qq.com/asset",
+	} {
+		if _, err := validateCommentMediaURL(rawURL, normalizeCommentMediaHosts(nil)); err == nil {
+			t.Fatalf("unsafe URL accepted: %s", rawURL)
+		}
+	}
+}
+
 func TestCommentMediaResolverRejectsInvalidAndOversizedResponses(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -239,6 +415,7 @@ func TestCommentMediaResolverRejectsInvalidAndOversizedResponses(t *testing.T) {
 		maximum  int64
 	}{
 		{"signature mismatch", "image/png", []byte("not-an-image"), 1024},
+		{"JPEG alias with PNG bytes", "image/jpg", testImageBytes(t, "png"), 1024},
 		{"unsupported mime", "application/octet-stream", testImageBytes(t, "png"), 1024},
 		{"oversized", "image/png", append(testImageBytes(t, "png"), make([]byte, 1024)...), 32},
 	}

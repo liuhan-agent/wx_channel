@@ -241,9 +241,20 @@ func summarizeCommentMediaShape(item map[string]any, counts map[string]int) {
 				}
 				counts[path+"[]."+key+":"+state]++
 			}
+			counts[path+"[]:candidate:"+commentMediaCandidateShape(descriptor)]++
 			counts[path+"[]:other_fields"] += len(descriptor) - knownFields
 		}
 	}
+}
+
+func commentMediaCandidateShape(descriptor map[string]any) string {
+	if commentMediaString(descriptor, "Url", "url") != "" {
+		return "direct"
+	}
+	if commentMediaString(descriptor, "EncryptUrl", "encryptUrl") != "" {
+		return "encrypted"
+	}
+	return "unavailable"
 }
 
 func safeMediaTypeCode(value any) string {

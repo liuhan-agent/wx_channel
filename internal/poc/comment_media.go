@@ -277,6 +277,11 @@ func writeBoundedCommentMedia(temp *os.File, response *http.Response, maximum in
 func validateCommentMediaFile(path string, prefix []byte, declared string, byteSize int64) (string, string, error) {
 	mimeType, extension := detectCommentMediaType(prefix)
 	declaredType, _, err := mime.ParseMediaType(declared)
+	// WeChat's image CDN uses this JPEG alias. The file still has to pass
+	// the signature and dimension checks below and is stored as image/jpeg.
+	if strings.EqualFold(declaredType, "image/jpg") {
+		declaredType = "image/jpeg"
+	}
 	if err != nil || mimeType == "" || !strings.EqualFold(declaredType, mimeType) {
 		return "", "", errors.New("media MIME mismatch")
 	}
@@ -388,6 +393,13 @@ func validateCommentMediaURL(rawURL string, allowedHosts map[string]struct{}) (*
 	if parsed != nil {
 		host = strings.ToLower(parsed.Hostname())
 	}
+	// WeChat returns comment images on this CDN with an HTTP locator. Fetch
+	// the same path and query over HTTPS; never downgrade an image request.
+	if err == nil && parsed != nil && parsed.Scheme == "http" && host == "wxapp.tc.qq.com" &&
+		(parsed.Port() == "" || parsed.Port() == "80") {
+		parsed.Scheme = "https"
+		parsed.Host = host
+	}
 	if err != nil || parsed == nil || parsed.Scheme != "https" || host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, errors.New("media URL rejected")
 	}
@@ -401,7 +413,7 @@ func normalizeCommentMediaHosts(configured map[string]struct{}) map[string]struc
 	if configured == nil {
 		configured = map[string]struct{}{
 			"mmbiz.qpic.cn": {}, "emoji.qpic.cn": {}, "mmbiz.qlogo.cn": {},
-			"wx.qlogo.cn": {}, "thirdwx.qlogo.cn": {}, "res.wx.qq.com": {},
+			"wx.qlogo.cn": {}, "thirdwx.qlogo.cn": {}, "res.wx.qq.com": {}, "wxapp.tc.qq.com": {},
 		}
 	}
 	normalized := make(map[string]struct{}, len(configured))

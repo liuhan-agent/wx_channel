@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -528,9 +529,9 @@ func extractCommentMediaCandidates(item map[string]any, commentRef string) []com
 				commentRef: commentRef,
 				mediaType:  group.mediaType,
 				ordinal:    index,
-				directURL:  commentMediaString(descriptor, "Url"),
-				cipherURL:  commentMediaString(descriptor, "EncryptUrl"),
-				aesKey:     commentMediaString(descriptor, "AesKey"),
+				directURL:  commentMediaDirectURL(descriptor),
+				cipherURL:  commentMediaString(descriptor, "EncryptUrl", "encryptUrl"),
+				aesKey:     commentMediaString(descriptor, "AesKey", "aesKey"),
 			}
 			if candidate.directURL == "" && candidate.cipherURL == "" {
 				continue
@@ -541,12 +542,37 @@ func extractCommentMediaCandidates(item map[string]any, commentRef string) []com
 	return candidates
 }
 
-func commentMediaString(descriptor map[string]any, key string) string {
-	value, ok := descriptor[key].(string)
-	if !ok {
+func commentMediaDirectURL(descriptor map[string]any) string {
+	base := commentMediaString(descriptor, "Url", "url")
+	token := strings.TrimLeft(commentMediaString(descriptor, "token"), "?&")
+	if base == "" || token == "" {
+		return base
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(value)
+	// The token is a query fragment. Keep its signature bytes and the base
+	// query intact: decoding or form encoding changes literal '+' and '%'.
+	if parsed.RawQuery != "" && !strings.HasSuffix(parsed.RawQuery, "&") {
+		parsed.RawQuery += "&"
+	}
+	parsed.RawQuery += token
+	return parsed.String()
+}
+
+func commentMediaString(descriptor map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := descriptor[key].(string)
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func commentMediaRef(comment Comment, source SourceRef) string {
